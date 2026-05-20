@@ -1,0 +1,26 @@
+[Unit]
+Description=TCP Session Monitor (client)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+WorkingDirectory=/opt/tcp-monitor
+# Replace 192.168.1.10 with the actual server IP
+ExecStart=/usr/bin/python3 /opt/tcp-monitor/tcp_monitor_client.py \
+    192.168.1.10 \
+    --port 9700 \
+    --metrics-port 9702 \
+    --heartbeat-interval 30 \
+    --max-misses 3 \
+    --reconnect-delay 10 \
+    --log-level INFO
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tcp-monitor-client
+
+[Install]
+WantedBy=multi-user.target
