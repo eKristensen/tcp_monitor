@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=nobody
 WorkingDirectory=/opt/tcp-monitor
-ExecStart=/usr/bin/python3 /opt/tcp-monitor/tcp_monitor_server.py \
+ExecStart=/usr/bin/python3 -u /opt/tcp-monitor/tcp_monitor_server.py \
     --port 9700 \
     --metrics-port 9701 \
     --heartbeat-interval 30 \
