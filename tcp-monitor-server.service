@@ -6,7 +6,6 @@ Wants=network-online.target
 [Service]
 Type=simple
 DynamicUser=yes
-User=tcp-monitor
 WorkingDirectory=/opt/tcp-monitor
 ExecStart=/opt/tcp-monitor/venv/bin/python3 -u /opt/tcp-monitor/tcp_monitor_server.py \
     --port 9700 \
