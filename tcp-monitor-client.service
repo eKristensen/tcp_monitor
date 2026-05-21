@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=nobody
+DynamicUser=yes
 WorkingDirectory=/opt/tcp-monitor
 # Replace 192.168.1.10 with the actual server IP
-ExecStart=/usr/bin/python3 -u /opt/tcp-monitor/tcp_monitor_client.py \
+ExecStart=/opt/tcp-monitor/venv/bin/python3 -u /opt/tcp-monitor/tcp_monitor_client.py \
     192.168.1.10 \
     --port 9700 \
     --metrics-port 9702 \

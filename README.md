@@ -68,26 +68,30 @@ the `role` and `instance` labels you add in your scrape config.
 
 ## Setup
 
-### 1. Install the dependency (both servers)
-
-```bash
-pip3 install prometheus_client
-```
-
-Or without network access:
-
-```bash
-# On a machine with internet, download the wheel:
-pip3 download prometheus_client -d /tmp/prometheus_wheel/
-# Copy to servers, then:
-pip3 install --no-index --find-links=/tmp/prometheus_wheel/ prometheus_client
-```
-
-### 2. Deploy the scripts
+### 1. Deploy the scripts and create the virtualenv (both servers)
 
 ```bash
 sudo mkdir -p /opt/tcp-monitor
 sudo cp tcp_monitor_server.py tcp_monitor_client.py /opt/tcp-monitor/
+python3 -m venv /opt/tcp-monitor/venv
+/opt/tcp-monitor/venv/bin/pip install prometheus_client
+```
+
+Without internet access:
+
+```bash
+# On a machine with internet, download the wheel:
+pip3 download prometheus_client -d /tmp/prometheus_wheel/
+# Copy /tmp/prometheus_wheel/ to the server, then:
+/opt/tcp-monitor/venv/bin/pip install --no-index --find-links=/tmp/prometheus_wheel/ prometheus_client
+```
+
+Set permissions so the systemd dynamic user (an ephemeral UID with no group membership)
+can read the files via "other" bits:
+
+```bash
+sudo chmod -R 755 /opt/tcp-monitor   # directories: rwxr-xr-x
+sudo chmod 644 /opt/tcp-monitor/*.py  # scripts: rw-r--r-- (python3 reads, not executes)
 ```
 
 ### 3. Open firewall ports
