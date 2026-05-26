@@ -247,6 +247,10 @@ def run_session(sock, server_addr, metrics, args):
             except ConnectionError:
                 reason = "remote_close"
                 break
+            except OSError as exc:
+                reason = "local_error"
+                log.warning("Recv error: %s", exc)
+                break
 
     except OSError as exc:
         reason = "local_error"
