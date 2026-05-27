@@ -57,7 +57,7 @@ impl Metrics {
             }};
         }
 
-        let m = Arc::new(Metrics {
+        Arc::new(Metrics {
             srv_session_active: reg!("tcp_monitor_server_session_active",
                 "1 if a server session is currently active with this peer"),
             srv_session_start: reg!("tcp_monitor_server_session_start_timestamp_seconds",
@@ -97,9 +97,7 @@ impl Metrics {
                 "Client session disconnects by peer and reason"),
 
             registry,
-        });
-
-        m
+        })
     }
 
     /// Pre-create all disconnect reason label combinations so they appear in

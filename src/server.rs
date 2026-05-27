@@ -4,7 +4,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
+
+/// Hard cap on concurrent inbound heartbeat sessions.
+/// Protects against resource exhaustion from connection floods.
+const MAX_CONNECTIONS: usize = 128;
 
 pub async fn run(
     bind: String,
@@ -14,38 +19,74 @@ pub async fn run(
     node_name: String,
     metrics: Arc<Metrics>,
 ) {
-    let addr: SocketAddr = format!("{}:{}", bind, port).parse().expect("invalid bind address");
-    let probe_addr: SocketAddr = format!("{}:{}", bind, probe_port).parse().expect("invalid probe address");
+    let addr: SocketAddr = format!("{}:{}", bind, port)
+        .parse()
+        .expect("invalid bind address");
+    let probe_addr: SocketAddr = format!("{}:{}", bind, probe_port)
+        .parse()
+        .expect("invalid probe bind address");
 
-    let listener = TcpListener::bind(addr).await.expect("failed to bind heartbeat port");
+    let listener = TcpListener::bind(addr)
+        .await
+        .expect("failed to bind heartbeat port");
     info!("Server listening on {}", addr);
 
-    let probe_listener = TcpListener::bind(probe_addr).await.expect("failed to bind probe port");
+    let probe_listener = TcpListener::bind(probe_addr)
+        .await
+        .expect("failed to bind probe port");
     info!("Probe port listening on {}", probe_addr);
 
-    let probe_task = tokio::spawn(run_probe_port(probe_listener));
+    let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
-    let heartbeat_task = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, peer_addr)) => {
-                    let node = node_name.clone();
-                    let m = metrics.clone();
-                    tokio::spawn(async move {
-                        handle_connection(stream, peer_addr, recv_timeout, node, m).await;
-                    });
-                }
-                Err(e) => {
-                    error!("Accept error: {}", e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-    });
+    let heartbeat_task = {
+        let node = node_name.clone();
+        let m = metrics.clone();
+        let s = sem.clone();
+        tokio::spawn(async move {
+            accept_loop(listener, recv_timeout, node, m, s).await;
+        })
+    };
+
+    let probe_task = tokio::spawn(probe_accept_loop(probe_listener, sem));
 
     tokio::select! {
         _ = heartbeat_task => {},
         _ = probe_task => {},
+    }
+}
+
+async fn accept_loop(
+    listener: TcpListener,
+    recv_timeout: u64,
+    node_name: String,
+    metrics: Arc<Metrics>,
+    sem: Arc<Semaphore>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer_addr)) => {
+                let permit = match Arc::clone(&sem).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!(
+                            "Connection limit ({}) reached, dropping {}",
+                            MAX_CONNECTIONS, peer_addr
+                        );
+                        continue;
+                    }
+                };
+                let node = node_name.clone();
+                let m = metrics.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    handle_connection(stream, peer_addr, recv_timeout, node, m).await;
+                });
+            }
+            Err(e) => {
+                error!("Accept error: {}", e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 
@@ -56,10 +97,15 @@ async fn handle_connection(
     node_name: String,
     metrics: Arc<Metrics>,
 ) {
-    let peer_name = protocol::recv_handshake(&mut stream, 5).await.unwrap_or_else(|_| "unknown".to_string());
+    let peer_name = protocol::recv_handshake(&mut stream, 5)
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
     info!("Session started: peer={} addr={}", peer_name, peer_addr);
 
-    let label = PeerLabel { node: node_name.clone(), peer: peer_name.clone() };
+    let label = PeerLabel {
+        node: node_name.clone(),
+        peer: peer_name.clone(),
+    };
     metrics.init_disconnect_labels(&node_name, &peer_name);
 
     let start_ts = now_f64();
@@ -72,13 +118,19 @@ async fn handle_connection(
     let duration = now_f64() - start_ts;
     metrics.srv_session_active.get_or_create(&label).set(0);
     metrics.srv_session_duration.get_or_create(&label).set(duration);
-    metrics.srv_disconnects.get_or_create(&DisconnectLabel {
-        node: node_name.clone(),
-        peer: peer_name.clone(),
-        reason: reason.to_string(),
-    }).inc();
+    metrics
+        .srv_disconnects
+        .get_or_create(&DisconnectLabel {
+            node: node_name,
+            peer: peer_name.clone(),
+            reason: reason.to_string(),
+        })
+        .inc();
 
-    info!("Session ended: peer={} duration={:.1}s reason={}", peer_name, duration, reason);
+    info!(
+        "Session ended: peer={} duration={:.1}s reason={}",
+        peer_name, duration, reason
+    );
 }
 
 async fn drive_session(
@@ -96,17 +148,21 @@ async fn drive_session(
         .await;
 
         match result {
-            Err(_) => return "timeout",
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => return "connection_reset",
+            Err(_timeout) => return "timeout",
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                return "connection_reset"
+            }
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return "remote_close",
             Ok(Err(_)) => return "local_error",
             Ok(Ok(hb)) => {
                 let now = now_f64();
                 metrics.srv_heartbeats_rx.get_or_create(label).inc();
                 metrics.srv_last_heartbeat.get_or_create(label).set(now);
-                metrics.srv_session_duration.get_or_create(label).set(now - start_ts);
+                metrics
+                    .srv_session_duration
+                    .get_or_create(label)
+                    .set(now - start_ts);
 
-                // Echo the packet back.
                 let mut buf = [0u8; protocol::PACKET_SIZE];
                 buf[..8].copy_from_slice(&hb.seq.to_be_bytes());
                 buf[8..].copy_from_slice(&hb.timestamp.to_bits().to_be_bytes());
@@ -119,19 +175,27 @@ async fn drive_session(
     }
 }
 
-/// Probe port: accept, send banner, hold open until peer closes.
-async fn run_probe_port(listener: TcpListener) {
+/// Probe port: accept → send banner → hold until peer closes.
+/// Used by the Prometheus Blackbox Exporter for TCP establishment and response tests.
+async fn probe_accept_loop(listener: TcpListener, sem: Arc<Semaphore>) {
     loop {
         match listener.accept().await {
             Ok((mut stream, addr)) => {
+                let permit = match Arc::clone(&sem).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("Probe connection limit reached, dropping {}", addr);
+                        continue;
+                    }
+                };
                 tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
+                    let _permit = permit;
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let _ = stream.write_all(b"TCP-MONITOR OK\r\n").await;
-                    // Drain until the client closes, so the connection isn't
-                    // immediately reset (important for blackbox establishment test).
+                    // Drain until the client closes so the connection isn't reset immediately.
                     let mut buf = [0u8; 64];
                     loop {
-                        match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                        match stream.read(&mut buf).await {
                             Ok(0) | Err(_) => break,
                             Ok(_) => {}
                         }
