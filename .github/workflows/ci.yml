@@ -38,26 +38,36 @@ jobs:
           set -euo pipefail
 
           cat > /tmp/smoke.toml << 'TOML'
-          [node]
-          name = "ci-smoke"
-          [server]
-          port         = 19700
-          metrics_port = 19701
-          probe_port   = 19702
-          recv_timeout = 10
-          TOML
+[node]
+name = "ci-smoke"
+[server]
+port         = 19700
+metrics_port = 19701
+probe_port   = 19702
+recv_timeout = 10
+TOML
 
           ./target/release/tcp-monitor --config /tmp/smoke.toml &
           PID=$!
           trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true' EXIT
 
-          sleep 1
+          # Wait up to 15 s for the metrics endpoint to become ready.
+          curl -sf --retry 15 --retry-delay 1 --retry-connrefused \
+            http://localhost:19701/metrics > /dev/null
 
-          # /metrics must respond with 200
-          curl -sf http://localhost:19701/metrics > /dev/null
-
-          # Probe port must send the banner then close
-          BANNER=$(echo -n | nc -w 3 127.0.0.1 19702 || true)
+          # Probe port must respond with the expected banner.
+          # Use Python instead of nc to avoid OpenBSD netcat's half-close behaviour
+          # and to sidestep \r in the response string.
+          BANNER=$(python3 -c "
+import socket, sys
+try:
+    with socket.create_connection(('127.0.0.1', 19702), timeout=5) as s:
+        data = s.recv(64).decode().strip()
+        print(data)
+except Exception as e:
+    print('CONNECT_ERROR:', e, file=sys.stderr)
+    sys.exit(1)
+")
           if [[ "$BANNER" != "TCP-MONITOR OK" ]]; then
             echo "ERROR: probe banner was '$BANNER', expected 'TCP-MONITOR OK'"
             exit 1
@@ -75,32 +85,32 @@ jobs:
           set -euo pipefail
 
           cat > /tmp/e2e-server.toml << 'TOML'
-          [node]
-          name = "ci-server"
-          [server]
-          port         = 19710
-          metrics_port = 19711
-          probe_port   = 19712
-          recv_timeout = 10
-          TOML
+[node]
+name = "ci-server"
+[server]
+port         = 19710
+metrics_port = 19711
+probe_port   = 19712
+recv_timeout = 10
+TOML
 
           cat > /tmp/e2e-client.toml << 'TOML'
-          [node]
-          name = "ci-client"
-          [server]
-          port         = 19720
-          metrics_port = 19721
-          probe_port   = 19722
-          recv_timeout = 10
-          [client]
-          heartbeat_interval = 2
-          max_misses         = 3
-          reconnect_delay    = 2
-          [[peers]]
-          name = "ci-server"
-          host = "127.0.0.1"
-          port = 19710
-          TOML
+[node]
+name = "ci-client"
+[server]
+port         = 19720
+metrics_port = 19721
+probe_port   = 19722
+recv_timeout = 10
+[client]
+heartbeat_interval = 2
+max_misses         = 3
+reconnect_delay    = 2
+[[peers]]
+name = "ci-server"
+host = "127.0.0.1"
+port = 19710
+TOML
 
           ./target/release/tcp-monitor --config /tmp/e2e-server.toml &
           SRV=$!
@@ -108,12 +118,19 @@ jobs:
           CLI=$!
           trap 'kill "$SRV" "$CLI" 2>/dev/null || true; wait "$SRV" "$CLI" 2>/dev/null || true' EXIT
 
-          sleep 7  # allow at least 3 heartbeats at 2 s interval
+          # Wait for both metrics endpoints to come up.
+          curl -sf --retry 15 --retry-delay 1 --retry-connrefused \
+            http://localhost:19711/metrics > /dev/null
+          curl -sf --retry 15 --retry-delay 1 --retry-connrefused \
+            http://localhost:19721/metrics > /dev/null
+
+          # Allow at least 3 heartbeats at 2 s interval.
+          sleep 8
 
           SRV_METRICS=$(curl -sf http://localhost:19711/metrics)
           CLI_METRICS=$(curl -sf http://localhost:19721/metrics)
 
-          # Server must have received heartbeats from the client
+          # Server must have received heartbeats from the client.
           SRV_HB=$(echo "$SRV_METRICS" \
             | grep 'tcp_monitor_server_heartbeats_received_total{node="ci-server",peer="ci-client"}' \
             | awk '{print $2}')
@@ -123,7 +140,7 @@ jobs:
             exit 1
           fi
 
-          # Client must have received echoes from the server
+          # Client must have received echoes from the server.
           CLI_HB=$(echo "$CLI_METRICS" \
             | grep 'tcp_monitor_client_heartbeats_received_total{node="ci-client",peer="ci-server"}' \
             | awk '{print $2}')
@@ -133,7 +150,7 @@ jobs:
             exit 1
           fi
 
-          # RTT must be non-zero
+          # RTT must be set and non-zero.
           RTT=$(echo "$CLI_METRICS" \
             | grep 'tcp_monitor_client_heartbeat_rtt_seconds{' \
             | awk '{print $2}')
@@ -154,26 +171,26 @@ jobs:
           set -euo pipefail
 
           cat > /tmp/reload.toml << 'TOML'
-          [node]
-          name = "ci-reload"
-          [server]
-          port         = 19730
-          metrics_port = 19731
-          probe_port   = 19732
-          recv_timeout = 10
-          TOML
+[node]
+name = "ci-reload"
+[server]
+port         = 19730
+metrics_port = 19731
+probe_port   = 19732
+recv_timeout = 10
+TOML
 
           ./target/release/tcp-monitor --config /tmp/reload.toml &
           PID=$!
           trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true' EXIT
 
-          sleep 1
-          curl -sf http://localhost:19731/metrics > /dev/null
+          curl -sf --retry 15 --retry-delay 1 --retry-connrefused \
+            http://localhost:19731/metrics > /dev/null
 
           kill -HUP "$PID"
           sleep 1
 
-          # Must still be running and serving metrics after SIGHUP
+          # Must still be running and serving metrics after SIGHUP.
           curl -sf http://localhost:19731/metrics > /dev/null
 
           echo "SIGHUP reload test passed"
@@ -188,28 +205,28 @@ jobs:
           set -euo pipefail
 
           cat > /tmp/badcfg.toml << 'TOML'
-          [node]
-          name = "ci-badcfg"
-          [server]
-          port         = 19740
-          metrics_port = 19741
-          probe_port   = 19742
-          recv_timeout = 10
-          TOML
+[node]
+name = "ci-badcfg"
+[server]
+port         = 19740
+metrics_port = 19741
+probe_port   = 19742
+recv_timeout = 10
+TOML
 
           ./target/release/tcp-monitor --config /tmp/badcfg.toml &
           PID=$!
           trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true' EXIT
 
-          sleep 1
-          curl -sf http://localhost:19741/metrics > /dev/null
+          curl -sf --retry 15 --retry-delay 1 --retry-connrefused \
+            http://localhost:19741/metrics > /dev/null
 
-          # Overwrite config with invalid TOML
+          # Overwrite config with invalid TOML, then reload.
           echo 'this is not valid toml = {{{{' > /tmp/badcfg.toml
           kill -HUP "$PID"
           sleep 1
 
-          # Process must still be running
+          # Process must still be running.
           if ! curl -sf http://localhost:19741/metrics > /dev/null; then
             echo "ERROR: process crashed after SIGHUP with bad config"
             exit 1
@@ -219,12 +236,11 @@ jobs:
 
       # -----------------------------------------------------------------------
       # Systemd unit file validation
-      # Installs the binary and uses systemd-analyze to check the unit file.
+      # Installs the binary and uses systemd-analyze to verify the unit file.
       # -----------------------------------------------------------------------
       - name: Validate systemd unit file
         run: |
           sudo cp target/release/tcp-monitor /usr/local/bin/tcp-monitor
           sudo mkdir -p /etc/tcp-monitor
-          # Provide a minimal valid config so systemd-analyze can load the unit.
           printf '[node]\nname = "ci"\n' | sudo tee /etc/tcp-monitor/config.toml > /dev/null
           systemd-analyze verify tcp-monitor.service
