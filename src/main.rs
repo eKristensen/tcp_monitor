@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -38,6 +39,7 @@ async fn main() {
 
     let metrics = metrics::Metrics::new();
     let (config_tx, config_rx) = watch::channel(initial_config.clone());
+    let shutdown = CancellationToken::new();
 
     // SIGHUP reloads the config file and broadcasts the new version.
     // Errors are logged; the running config is kept untouched on any failure.
@@ -85,22 +87,35 @@ async fn main() {
     }
 
     // TCP server (always runs; listens for inbound peer connections).
-    {
+    let server_handle = {
         let srv = initial_config.server.clone();
-        let node = initial_config.node.name.clone();
-        let m = metrics.clone();
-        tokio::spawn(server::run(srv.bind, srv.port, srv.probe_port, srv.recv_timeout, node, m));
-    }
+        tokio::spawn(server::run(server::ServerArgs {
+            bind: srv.bind,
+            port: srv.port,
+            probe_port: srv.probe_port,
+            recv_timeout: srv.recv_timeout,
+            node_name: initial_config.node.name.clone(),
+            metrics: metrics.clone(),
+            cancel: shutdown.clone(),
+            config_rx: config_rx.clone(),
+        }))
+    };
 
     // Client manager (maintains outbound peer sessions; reacts to SIGHUP reloads).
-    {
-        let node = initial_config.node.name.clone();
+    let client_handle = {
         let m = metrics.clone();
-        tokio::spawn(client::run_manager(node, m, config_rx));
-    }
+        tokio::spawn(client::run_manager(m, config_rx))
+    };
 
     shutdown_signal().await;
     info!("Shutting down");
+
+    // Cancel the server; drop config_tx so run_manager's watch receiver sees the
+    // sender gone and exits its loop, cancelling all peer tasks before returning.
+    shutdown.cancel();
+    drop(config_tx);
+
+    let _ = tokio::join!(server_handle, client_handle);
 }
 
 fn parse_config_path() -> PathBuf {
@@ -151,7 +166,7 @@ async fn metrics_handler(State(metrics): State<Arc<metrics::Metrics>>) -> impl I
         axum::http::StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
+                "text/plain; version=0.0.4; charset=utf-8",
         )],
         buf,
     )

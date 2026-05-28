@@ -17,11 +17,13 @@ Node A                              Node B
 | tcp-monitor                  |    | tcp-monitor                  |
 |                              |    |                              |
 |  heartbeat port :9700 <------+----+-- client session             |
-|  metrics        :9701        |    |  metrics        :9701        |
-|  probe port     :9702        |    |  probe port     :9702        |
-|      ^                       |    |      ^                       |
-|   Prometheus / Blackbox      |    |   Prometheus / Blackbox      |
-+------------------------------+    +------------------------------+
+|  client session  --------+   |    |   heartbeat port :9700       |
+|  metrics        :9701    +---+--->+--> (same binary, both roles) |
+|  probe port     :9702        |    |  metrics        :9701        |
+|      ^                       |    |  probe port     :9702        |
+|   Prometheus / Blackbox      |    |      ^                       |
++------------------------------+    |   Prometheus / Blackbox      |
+                                    +------------------------------+
 ```
 
 - Every node **listens** on the heartbeat port. New clients can connect without
@@ -32,7 +34,8 @@ Node A                              Node B
   per-session metrics, so Prometheus can identify each session by name rather
   than IP.
 - Adding or removing `[[peers]]` from the config file is picked up live via
-  inotify — no restart, no disruption to existing sessions.
+  `systemctl reload tcp-monitor` (SIGHUP) — no restart, no disruption to
+  existing sessions.
 - The **probe port** accepts connections, sends `TCP-MONITOR OK\r\n`, and holds
   the connection open. Use it with the Prometheus Blackbox Exporter for both
   TCP establishment and banner-response tests.
@@ -122,12 +125,11 @@ Minimal config (server-only node, no outbound sessions):
 name = "server1"
 
 [server]
-# All fields are optional; these are the defaults:
-# bind         = "0.0.0.0"
-# port         = 9700
-# metrics_port = 9701
-# probe_port   = 9702
-# recv_timeout = 90
+bind         = "0.0.0.0"
+port         = 9700
+metrics_port = 9701
+probe_port   = 9702
+recv_timeout = 90
 ```
 
 To also connect as a client, add:
@@ -225,12 +227,15 @@ journalctl -u tcp-monitor -f
 
 ## Adding a new peer (hot-reload)
 
-Edit `/etc/tcp-monitor/config.toml` and add a `[[peers]]` block. Save the file.
-The service detects the change via inotify and starts the new session within
-a second, with no restart. Existing sessions are unaffected.
+Edit `/etc/tcp-monitor/config.toml` and add a `[[peers]]` block, then run:
 
-If the config has a syntax error, the change is rejected and the current config
-continues running — the error is logged to journald.
+```bash
+sudo systemctl reload tcp-monitor
+```
+
+The service picks up the new peer immediately with no restart. Existing
+sessions are unaffected. If the config has a syntax error the reload is
+rejected and the running config continues — the error is logged to journald.
 
 ---
 

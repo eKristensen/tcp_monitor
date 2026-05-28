@@ -10,11 +10,19 @@ pub struct Heartbeat {
     pub timestamp: f64,
 }
 
+/// Encode a heartbeat packet into a fixed-size buffer.
+/// Used by both the client sender and the server echo path so the format stays in sync.
+pub fn encode_packet(seq: u64, timestamp: f64) -> [u8; PACKET_SIZE] {
+    let mut buf = [0u8; PACKET_SIZE];
+    buf[..8].copy_from_slice(&seq.to_be_bytes());
+    buf[8..].copy_from_slice(&timestamp.to_bits().to_be_bytes());
+    buf
+}
+
 /// Client calls this immediately after connect to announce its node name.
 /// Format: 4-byte BE u32 length + UTF-8 name bytes (max 256 bytes).
 pub async fn send_handshake(stream: &mut TcpStream, name: &str) -> std::io::Result<()> {
     let bytes = name.as_bytes();
-    // Truncate to 256 bytes to stay within the server's read limit.
     let bytes = &bytes[..bytes.len().min(256)];
     let len = bytes.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?;
@@ -23,18 +31,15 @@ pub async fn send_handshake(stream: &mut TcpStream, name: &str) -> std::io::Resu
 }
 
 /// Server calls this to read the client's node name from the handshake.
-/// Returns `"unknown"` on timeout or malformed input.
+/// Returns an error on timeout or I/O failure so the caller can close the connection
+/// rather than admitting it as a session with an "unknown" label.
 pub async fn recv_handshake(stream: &mut TcpStream, timeout_secs: u64) -> std::io::Result<String> {
-    let result = tokio::time::timeout(
+    tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
         read_handshake(stream),
     )
-    .await;
-
-    match result {
-        Ok(inner) => inner,
-        Err(_elapsed) => Ok("unknown".to_string()),
-    }
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timeout"))?
 }
 
 async fn read_handshake(stream: &mut TcpStream) -> std::io::Result<String> {
@@ -42,7 +47,10 @@ async fn read_handshake(stream: &mut TcpStream) -> std::io::Result<String> {
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len == 0 || len > 256 {
-        return Ok("unknown".to_string());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid handshake length",
+        ));
     }
     let mut name_buf = vec![0u8; len];
     stream.read_exact(&mut name_buf).await?;
@@ -70,10 +78,7 @@ pub async fn send_heartbeat(stream: &mut TcpStream, seq: u64) -> std::io::Result
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    let mut buf = [0u8; PACKET_SIZE];
-    buf[..8].copy_from_slice(&seq.to_be_bytes());
-    buf[8..].copy_from_slice(&ts.to_bits().to_be_bytes());
-    stream.write_all(&buf).await?;
+    stream.write_all(&encode_packet(seq, ts)).await?;
     Ok(ts)
 }
 

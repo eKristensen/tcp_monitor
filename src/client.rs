@@ -12,20 +12,29 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 
 pub async fn run_manager(
-    node_name: String,
     metrics: Arc<Metrics>,
     mut config_rx: watch::Receiver<Config>,
 ) {
-    // peer_name -> (cancel token, task handle)
-    let mut tasks: HashMap<String, (CancellationToken, tokio::task::JoinHandle<()>)> = HashMap::new();
+    // peer_name -> (peer config used at spawn time, cancel token, task handle)
+    let mut tasks: HashMap<String, (PeerConfig, CancellationToken, tokio::task::JoinHandle<()>)> =
+        HashMap::new();
 
     loop {
         let config = config_rx.borrow_and_update().clone();
+        let node_name = config.node.name.clone();
         let client_cfg = match &config.client {
             Some(c) => c.clone(),
             None => {
-                // No client config; wait for next change.
-                if config_rx.changed().await.is_err() { break; }
+                // No client config; cancel any existing tasks and wait for next change.
+                let drained: Vec<_> = tasks.drain().collect();
+                for (name, (_, token, handle)) in drained {
+                    info!("Removing peer session (no [client] config): {}", name);
+                    token.cancel();
+                    let _ = handle.await;
+                }
+                if config_rx.changed().await.is_err() {
+                    break;
+                }
                 continue;
             }
         };
@@ -36,21 +45,23 @@ pub async fn run_manager(
             .map(|p| (p.name.clone(), p.clone()))
             .collect();
 
-        // Cancel and remove tasks for peers that are no longer in config.
-        let removed: Vec<String> = tasks
-            .keys()
-            .filter(|n| !new_peers.contains_key(*n))
-            .cloned()
+        // Cancel tasks for peers removed from config or whose address changed.
+        let to_remove: Vec<String> = tasks
+            .iter()
+            .filter(|(name, (old_peer, _, _))| {
+                new_peers.get(*name) != Some(old_peer)
+            })
+            .map(|(name, _)| name.clone())
             .collect();
-        for name in removed {
-            if let Some((token, handle)) = tasks.remove(&name) {
+        for name in to_remove {
+            if let Some((_, token, handle)) = tasks.remove(&name) {
                 info!("Removing peer session: {}", name);
                 token.cancel();
                 let _ = handle.await;
             }
         }
 
-        // Spawn tasks for new peers.
+        // Spawn tasks for new peers (or peers whose config changed above).
         for (name, peer) in &new_peers {
             if !tasks.contains_key(name) {
                 let token = CancellationToken::new();
@@ -61,7 +72,7 @@ pub async fn run_manager(
                     metrics.clone(),
                     token.clone(),
                 ));
-                tasks.insert(name.clone(), (token, handle));
+                tasks.insert(name.clone(), (peer.clone(), token, handle));
                 info!("Started peer session: {}", name);
             }
         }
@@ -72,7 +83,7 @@ pub async fn run_manager(
     }
 
     // Shutdown: cancel all running tasks.
-    for (_, (token, handle)) in tasks {
+    for (_, (_, token, handle)) in tasks {
         token.cancel();
         let _ = handle.await;
     }

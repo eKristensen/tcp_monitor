@@ -89,6 +89,19 @@ impl Config {
             }
         }
 
+        if self.server.recv_timeout == 0 {
+            return Err("server.recv_timeout must be at least 1".to_string());
+        }
+
+        if let Some(ref c) = self.client {
+            if c.heartbeat_interval == 0 {
+                return Err("client.heartbeat_interval must be at least 1".to_string());
+            }
+            if c.reconnect_delay == 0 {
+                return Err("client.reconnect_delay must be at least 1".to_string());
+            }
+        }
+
         let mut seen: HashSet<&str> = HashSet::new();
         for peer in &self.peers {
             if peer.name.is_empty() {

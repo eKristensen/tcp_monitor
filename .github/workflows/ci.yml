@@ -29,8 +29,8 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy -- -D warnings
 
-      - name: Smoke test
-        run: ci/smoke-test.sh
+      - name: Server startup, metrics, and probe test
+        run: ci/server-startup-test.sh
 
       - name: End-to-end heartbeat test
         run: ci/e2e-test.sh

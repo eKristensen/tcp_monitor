@@ -1,24 +1,45 @@
 use crate::metrics::{DisconnectLabel, Metrics, PeerLabel};
 use crate::protocol;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Hard cap on concurrent inbound heartbeat sessions.
-/// Protects against resource exhaustion from connection floods.
 const MAX_CONNECTIONS: usize = 128;
 
-pub async fn run(
-    bind: String,
-    port: u16,
-    probe_port: u16,
-    recv_timeout: u64,
-    node_name: String,
-    metrics: Arc<Metrics>,
-) {
+/// Separate, smaller cap for probe connections (health-check only).
+const MAX_PROBE_CONNECTIONS: usize = 32;
+
+/// Close a probe connection that never sends or closes after this many seconds.
+const PROBE_IDLE_SECS: u64 = 30;
+
+pub struct ServerArgs {
+    pub bind: String,
+    pub port: u16,
+    pub probe_port: u16,
+    pub recv_timeout: u64,
+    pub node_name: String,
+    pub metrics: Arc<Metrics>,
+    pub cancel: CancellationToken,
+    pub config_rx: tokio::sync::watch::Receiver<crate::config::Config>,
+}
+
+pub async fn run(args: ServerArgs) {
+    let ServerArgs {
+        bind,
+        port,
+        probe_port,
+        recv_timeout: initial_recv_timeout,
+        node_name,
+        metrics,
+        cancel,
+        mut config_rx,
+    } = args;
     let addr: SocketAddr = format!("{}:{}", bind, port)
         .parse()
         .expect("invalid bind address");
@@ -36,34 +57,69 @@ pub async fn run(
         .expect("failed to bind probe port");
     info!("Probe port listening on {}", probe_addr);
 
-    let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    // recv_timeout is shared so SIGHUP reloads take effect for new sessions.
+    let recv_timeout = Arc::new(AtomicU64::new(initial_recv_timeout));
+
+    let heartbeat_sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let probe_sem = Arc::new(Semaphore::new(MAX_PROBE_CONNECTIONS));
 
     let heartbeat_task = {
         let node = node_name.clone();
         let m = metrics.clone();
-        let s = sem.clone();
+        let s = heartbeat_sem.clone();
+        let c = cancel.clone();
+        let rt = recv_timeout.clone();
         tokio::spawn(async move {
-            heartbeat_accept_loop(listener, recv_timeout, node, m, s).await;
+            heartbeat_accept_loop(listener, rt, node, m, s, c).await;
         })
     };
 
-    let probe_task = tokio::spawn(probe_accept_loop(probe_listener, sem));
+    let probe_task = {
+        let c = cancel.clone();
+        tokio::spawn(probe_accept_loop(probe_listener, probe_sem, c))
+    };
+
+    // React to recv_timeout changes from SIGHUP reloads.
+    // bind/port changes require a restart — rebinding a live port is disruptive.
+    let config_task = {
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = config_rx.changed() => {
+                        if result.is_err() { break; }
+                        let new_timeout = config_rx.borrow_and_update().server.recv_timeout;
+                        recv_timeout.store(new_timeout, Ordering::Relaxed);
+                        info!("Server recv_timeout updated to {}s", new_timeout);
+                    }
+                    _ = c.cancelled() => break,
+                }
+            }
+        })
+    };
 
     tokio::select! {
         _ = heartbeat_task => {},
         _ = probe_task => {},
+        _ = config_task => {},
+        _ = cancel.cancelled() => {},
     }
 }
 
 async fn heartbeat_accept_loop(
     listener: TcpListener,
-    recv_timeout: u64,
+    recv_timeout: Arc<AtomicU64>,
     node_name: String,
     metrics: Arc<Metrics>,
     sem: Arc<Semaphore>,
+    cancel: CancellationToken,
 ) {
     loop {
-        match listener.accept().await {
+        let accept = tokio::select! {
+            r = listener.accept() => r,
+            _ = cancel.cancelled() => return,
+        };
+        match accept {
             Ok((stream, peer_addr)) => {
                 let permit = match Arc::clone(&sem).try_acquire_owned() {
                     Ok(p) => p,
@@ -77,9 +133,10 @@ async fn heartbeat_accept_loop(
                 };
                 let node = node_name.clone();
                 let m = metrics.clone();
+                let rt = recv_timeout.load(Ordering::Relaxed);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    handle_connection(stream, peer_addr, recv_timeout, node, m).await;
+                    handle_connection(stream, peer_addr, rt, node, m).await;
                 });
             }
             Err(e) => {
@@ -97,9 +154,13 @@ async fn handle_connection(
     node_name: String,
     metrics: Arc<Metrics>,
 ) {
-    let peer_name = protocol::recv_handshake(&mut stream, 5)
-        .await
-        .unwrap_or_else(|_| "unknown".to_string());
+    let peer_name = match protocol::recv_handshake(&mut stream, 5).await {
+        Ok(name) => name,
+        Err(_) => {
+            debug!("Handshake failed from {}, closing", peer_addr);
+            return;
+        }
+    };
     info!("Session started: peer={} addr={}", peer_name, peer_addr);
 
     let label = PeerLabel {
@@ -152,7 +213,12 @@ async fn drive_session(
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {
                 return "connection_reset"
             }
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return "remote_close",
+            Ok(Err(e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.kind() == std::io::ErrorKind::BrokenPipe =>
+            {
+                return "remote_close"
+            }
             Ok(Err(_)) => return "local_error",
             Ok(Ok(hb)) => {
                 let now = now_f64();
@@ -163,23 +229,35 @@ async fn drive_session(
                     .get_or_create(label)
                     .set(now - start_ts);
 
-                let mut buf = [0u8; protocol::PACKET_SIZE];
-                buf[..8].copy_from_slice(&hb.seq.to_be_bytes());
-                buf[8..].copy_from_slice(&hb.timestamp.to_bits().to_be_bytes());
-                if let Err(e) = tokio::io::AsyncWriteExt::write_all(stream, &buf).await {
-                    warn!("Echo write error: {}", e);
-                    return "local_error";
+                let packet = protocol::encode_packet(hb.seq, hb.timestamp);
+                if let Err(e) = tokio::io::AsyncWriteExt::write_all(stream, &packet).await {
+                    match e.kind() {
+                        std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset => return "connection_reset",
+                        _ => {
+                            warn!("Echo write error: {}", e);
+                            return "local_error";
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/// Probe port: accept → send banner → hold until peer closes.
+/// Probe port: accept → send banner → drain until peer closes (or idle timeout).
 /// Used by the Prometheus Blackbox Exporter for TCP establishment and response tests.
-async fn probe_accept_loop(listener: TcpListener, sem: Arc<Semaphore>) {
+async fn probe_accept_loop(
+    listener: TcpListener,
+    sem: Arc<Semaphore>,
+    cancel: CancellationToken,
+) {
     loop {
-        match listener.accept().await {
+        let accept = tokio::select! {
+            r = listener.accept() => r,
+            _ = cancel.cancelled() => return,
+        };
+        match accept {
             Ok((mut stream, addr)) => {
                 let permit = match Arc::clone(&sem).try_acquire_owned() {
                     Ok(p) => p,
@@ -192,14 +270,18 @@ async fn probe_accept_loop(listener: TcpListener, sem: Arc<Semaphore>) {
                     let _permit = permit;
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let _ = stream.write_all(b"TCP-MONITOR OK\r\n").await;
-                    // Drain until the client closes so the connection isn't reset immediately.
+                    // Drain until the client closes; timeout prevents permit exhaustion
+                    // from clients that never close.
                     let mut buf = [0u8; 64];
-                    loop {
-                        match stream.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {}
+                    let drain = async {
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
                         }
-                    }
+                    };
+                    let _ = tokio::time::timeout(Duration::from_secs(PROBE_IDLE_SECS), drain).await;
                     debug!("Probe connection closed: {}", addr);
                 });
             }
