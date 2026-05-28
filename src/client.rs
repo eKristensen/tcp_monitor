@@ -18,6 +18,7 @@ pub async fn run_manager(
     // peer_name -> (peer config used at spawn time, cancel token, task handle)
     let mut tasks: HashMap<String, (PeerConfig, CancellationToken, tokio::task::JoinHandle<()>)> =
         HashMap::new();
+    let mut last_client_cfg: Option<ClientConfig> = None;
 
     loop {
         let config = config_rx.borrow_and_update().clone();
@@ -32,12 +33,27 @@ pub async fn run_manager(
                     token.cancel();
                     let _ = handle.await;
                 }
+                last_client_cfg = None;
                 if config_rx.changed().await.is_err() {
                     break;
                 }
                 continue;
             }
         };
+
+        // If ClientConfig changed, cancel all running tasks so they restart with new settings.
+        if last_client_cfg.as_ref() != Some(&client_cfg) {
+            if last_client_cfg.is_some() {
+                info!("ClientConfig changed, restarting all peer sessions");
+                let drained: Vec<_> = tasks.drain().collect();
+                for (name, (_, token, handle)) in drained {
+                    info!("Restarting peer session (client config change): {}", name);
+                    token.cancel();
+                    let _ = handle.await;
+                }
+            }
+            last_client_cfg = Some(client_cfg.clone());
+        }
 
         let new_peers: HashMap<String, PeerConfig> = config
             .peers
@@ -189,9 +205,10 @@ async fn run_session(
         }
         next_send += heartbeat_interval;
 
-        // Send heartbeat.
+        // Send heartbeat; record which seq we sent so we can validate the echo.
+        let sent_seq = seq;
         let send_ts = match tokio::select! {
-            r = protocol::send_heartbeat(&mut stream, seq) => r,
+            r = protocol::send_heartbeat(&mut stream, sent_seq) => r,
             _ = cancel.cancelled() => break 'session "cancelled",
         } {
             Ok(ts) => ts,
@@ -218,17 +235,34 @@ async fn run_session(
                 if consecutive_missed >= client_cfg.max_misses as i64 {
                     break 'session "timeout";
                 }
+                // After a timeout, reset the send schedule so the next heartbeat
+                // fires after a full interval rather than immediately.
+                next_send = tokio::time::Instant::now() + heartbeat_interval;
             }
             Ok(Err(e)) => break 'session classify_io_error(&e),
-            Ok(Ok(_echo)) => {
-                let rtt = now_f64() - send_ts;
-                consecutive_missed = 0;
-                let now_ts = now_f64();
-                metrics.client_heartbeats_rx.get_or_create(&label).inc();
-                metrics.client_consecutive_missed.get_or_create(&label).set(0);
-                metrics.client_rtt.get_or_create(&label).set(rtt);
-                metrics.client_last_heartbeat.get_or_create(&label).set(now_ts);
-                metrics.client_session_duration.get_or_create(&label).set(now_ts - start_ts);
+            Ok(Ok(echo)) => {
+                if echo.seq != sent_seq {
+                    // Stale or out-of-order echo — count as a miss.
+                    consecutive_missed += 1;
+                    metrics.client_heartbeats_missed.get_or_create(&label).inc();
+                    metrics.client_consecutive_missed.get_or_create(&label).set(consecutive_missed);
+                    warn!(
+                        "Stale echo peer={} got_seq={} expected_seq={} ({}/{})",
+                        peer.name, echo.seq, sent_seq, consecutive_missed, client_cfg.max_misses
+                    );
+                    if consecutive_missed >= client_cfg.max_misses as i64 {
+                        break 'session "timeout";
+                    }
+                } else {
+                    let rtt = now_f64() - send_ts;
+                    consecutive_missed = 0;
+                    let now_ts = now_f64();
+                    metrics.client_heartbeats_rx.get_or_create(&label).inc();
+                    metrics.client_consecutive_missed.get_or_create(&label).set(0);
+                    metrics.client_rtt.get_or_create(&label).set(rtt);
+                    metrics.client_last_heartbeat.get_or_create(&label).set(now_ts);
+                    metrics.client_session_duration.get_or_create(&label).set(now_ts - start_ts);
+                }
             }
         }
     };

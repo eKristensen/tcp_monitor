@@ -23,9 +23,12 @@ pub struct ServerConfig {
     pub metrics_port: u16,
     pub probe_port: u16,
     pub recv_timeout: u64,
+    /// Seconds before a probe connection that never closes is dropped.
+    #[serde(default = "default_probe_idle_timeout")]
+    pub probe_idle_timeout: u64,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct ClientConfig {
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
@@ -43,6 +46,9 @@ pub struct PeerConfig {
     pub port: u16,
 }
 
+fn default_probe_idle_timeout() -> u64 {
+    30
+}
 fn default_peer_port() -> u16 {
     9700
 }

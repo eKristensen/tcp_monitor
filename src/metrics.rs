@@ -3,7 +3,12 @@ use prometheus_client::{
     metrics::{counter::Counter, family::Family, gauge::Gauge},
     registry::Registry,
 };
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
+/// Hard cap on distinct inbound peer names that may allocate metric label entries.
+/// prometheus-client has no removal API, so entries are permanent; this bounds growth.
+pub const MAX_UNIQUE_SERVER_PEERS: usize = 512;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PeerLabel {
@@ -42,6 +47,8 @@ pub struct Metrics {
     pub client_disconnects: Family<DisconnectLabel, Counter>,
 
     pub registry: Registry,
+
+    seen_server_peers: Mutex<HashSet<String>>,
 }
 
 impl Metrics {
@@ -97,7 +104,22 @@ impl Metrics {
                 "Client session disconnects by peer and reason"),
 
             registry,
+            seen_server_peers: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Returns true if the peer may proceed (either already known or within the cap).
+    /// Returns false when the cap is reached; the caller should reject the connection.
+    pub fn try_register_server_peer(&self, peer: &str) -> bool {
+        let mut seen = self.seen_server_peers.lock().unwrap();
+        if seen.contains(peer) {
+            return true;
+        }
+        if seen.len() >= MAX_UNIQUE_SERVER_PEERS {
+            return false;
+        }
+        seen.insert(peer.to_string());
+        true
     }
 
     /// Pre-create all disconnect reason label combinations so they appear in

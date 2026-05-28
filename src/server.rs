@@ -15,14 +15,12 @@ const MAX_CONNECTIONS: usize = 128;
 /// Separate, smaller cap for probe connections (health-check only).
 const MAX_PROBE_CONNECTIONS: usize = 32;
 
-/// Close a probe connection that never sends or closes after this many seconds.
-const PROBE_IDLE_SECS: u64 = 30;
-
 pub struct ServerArgs {
     pub bind: String,
     pub port: u16,
     pub probe_port: u16,
     pub recv_timeout: u64,
+    pub probe_idle_timeout: u64,
     pub node_name: String,
     pub metrics: Arc<Metrics>,
     pub cancel: CancellationToken,
@@ -35,6 +33,7 @@ pub async fn run(args: ServerArgs) {
         port,
         probe_port,
         recv_timeout: initial_recv_timeout,
+        probe_idle_timeout: initial_probe_idle_timeout,
         node_name,
         metrics,
         cancel,
@@ -57,8 +56,9 @@ pub async fn run(args: ServerArgs) {
         .expect("failed to bind probe port");
     info!("Probe port listening on {}", probe_addr);
 
-    // recv_timeout is shared so SIGHUP reloads take effect for new sessions.
+    // Atomics shared with accept loops so SIGHUP reloads take effect for new sessions.
     let recv_timeout = Arc::new(AtomicU64::new(initial_recv_timeout));
+    let probe_idle_timeout = Arc::new(AtomicU64::new(initial_probe_idle_timeout));
 
     let heartbeat_sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let probe_sem = Arc::new(Semaphore::new(MAX_PROBE_CONNECTIONS));
@@ -76,10 +76,11 @@ pub async fn run(args: ServerArgs) {
 
     let probe_task = {
         let c = cancel.clone();
-        tokio::spawn(probe_accept_loop(probe_listener, probe_sem, c))
+        let pit = probe_idle_timeout.clone();
+        tokio::spawn(probe_accept_loop(probe_listener, probe_sem, pit, c))
     };
 
-    // React to recv_timeout changes from SIGHUP reloads.
+    // React to timeout changes from SIGHUP reloads.
     // bind/port changes require a restart — rebinding a live port is disruptive.
     let config_task = {
         let c = cancel.clone();
@@ -88,9 +89,11 @@ pub async fn run(args: ServerArgs) {
                 tokio::select! {
                     result = config_rx.changed() => {
                         if result.is_err() { break; }
-                        let new_timeout = config_rx.borrow_and_update().server.recv_timeout;
-                        recv_timeout.store(new_timeout, Ordering::Relaxed);
-                        info!("Server recv_timeout updated to {}s", new_timeout);
+                        let srv = config_rx.borrow_and_update().server.clone();
+                        recv_timeout.store(srv.recv_timeout, Ordering::Relaxed);
+                        probe_idle_timeout.store(srv.probe_idle_timeout, Ordering::Relaxed);
+                        info!("Server timeouts updated: recv={}s probe_idle={}s",
+                            srv.recv_timeout, srv.probe_idle_timeout);
                     }
                     _ = c.cancelled() => break,
                 }
@@ -161,6 +164,15 @@ async fn handle_connection(
             return;
         }
     };
+
+    if !metrics.try_register_server_peer(&peer_name) {
+        warn!(
+            "Server peer limit reached ({}), rejecting peer={} addr={}",
+            crate::metrics::MAX_UNIQUE_SERVER_PEERS, peer_name, peer_addr
+        );
+        return;
+    }
+
     info!("Session started: peer={} addr={}", peer_name, peer_addr);
 
     let label = PeerLabel {
@@ -250,6 +262,7 @@ async fn drive_session(
 async fn probe_accept_loop(
     listener: TcpListener,
     sem: Arc<Semaphore>,
+    probe_idle_timeout: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -266,6 +279,7 @@ async fn probe_accept_loop(
                         continue;
                     }
                 };
+                let idle_secs = probe_idle_timeout.load(Ordering::Relaxed);
                 tokio::spawn(async move {
                     let _permit = permit;
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -281,7 +295,7 @@ async fn probe_accept_loop(
                             }
                         }
                     };
-                    let _ = tokio::time::timeout(Duration::from_secs(PROBE_IDLE_SECS), drain).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(idle_secs), drain).await;
                     debug!("Probe connection closed: {}", addr);
                 });
             }
