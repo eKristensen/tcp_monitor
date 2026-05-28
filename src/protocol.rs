@@ -23,8 +23,7 @@ pub async fn send_handshake(stream: &mut TcpStream, name: &str) -> std::io::Resu
 }
 
 /// Server calls this to read the client's node name from the handshake.
-/// Returns `"unknown"` on timeout or malformed input — the session proceeds
-/// either way, labelled by the fallback name.
+/// Returns `"unknown"` on timeout or malformed input.
 pub async fn recv_handshake(stream: &mut TcpStream, timeout_secs: u64) -> std::io::Result<String> {
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
@@ -34,7 +33,6 @@ pub async fn recv_handshake(stream: &mut TcpStream, timeout_secs: u64) -> std::i
 
     match result {
         Ok(inner) => inner,
-        // Timeout is not a fatal error; session continues with "unknown".
         Err(_elapsed) => Ok("unknown".to_string()),
     }
 }
