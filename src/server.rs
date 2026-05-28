@@ -43,7 +43,7 @@ pub async fn run(
         let m = metrics.clone();
         let s = sem.clone();
         tokio::spawn(async move {
-            accept_loop(listener, recv_timeout, node, m, s).await;
+            heartbeat_accept_loop(listener, recv_timeout, node, m, s).await;
         })
     };
 
@@ -55,7 +55,7 @@ pub async fn run(
     }
 }
 
-async fn accept_loop(
+async fn heartbeat_accept_loop(
     listener: TcpListener,
     recv_timeout: u64,
     node_name: String,
