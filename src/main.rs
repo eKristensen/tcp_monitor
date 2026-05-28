@@ -39,7 +39,7 @@ async fn main() {
 
     let metrics = metrics::Metrics::new();
     let (config_tx, config_rx) = watch::channel(initial_config.clone());
-    let shutdown = CancellationToken::new();
+    let cancel_token = CancellationToken::new();
 
     // SIGHUP reloads the config file and broadcasts the new version.
     // Errors are logged; the running config is kept untouched on any failure.
@@ -97,23 +97,21 @@ async fn main() {
             probe_idle_timeout: srv.probe_idle_timeout,
             node_name: initial_config.node.name.clone(),
             metrics: metrics.clone(),
-            cancel: shutdown.clone(),
+            cancel: cancel_token.clone(),
             config_rx: config_rx.clone(),
         }))
     };
 
     // Client manager (maintains outbound peer sessions; reacts to SIGHUP reloads).
-    let client_handle = {
-        let m = metrics.clone();
-        tokio::spawn(client::run_manager(m, config_rx))
-    };
+    let client_handle = tokio::spawn(client::run_manager(metrics.clone(), config_rx));
 
-    shutdown_signal().await;
+    cancel_token_signal().await;
     info!("Shutting down");
 
-    // Cancel the server; drop config_tx so run_manager's watch receiver sees the
-    // sender gone and exits its loop, cancelling all peer tasks before returning.
-    shutdown.cancel();
+    // Activate the cancel token so the server accept loops stop.
+    // Dropping config_tx causes run_manager's watch receiver to see the sender
+    // gone and exit its loop, cancelling all peer tasks before returning.
+    cancel_token.cancel();
     drop(config_tx);
 
     let _ = tokio::join!(server_handle, client_handle);
@@ -144,7 +142,7 @@ fn parse_config_path() -> PathBuf {
 }
 
 /// Resolves on SIGTERM or Ctrl-C, whichever comes first.
-async fn shutdown_signal() {
+async fn cancel_token_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     let terminate = async {
         signal(SignalKind::terminate())

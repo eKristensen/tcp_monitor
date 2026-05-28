@@ -56,7 +56,9 @@ pub async fn run(args: ServerArgs) {
         .expect("failed to bind probe port");
     info!("Probe port listening on {}", probe_addr);
 
-    // Atomics shared with accept loops so SIGHUP reloads take effect for new sessions.
+    // Arc<AtomicU64> lets the config-watch task update these values on SIGHUP
+    // while the accept loops read them on each new connection — no mutex needed
+    // for a single-value load/store. Already-running sessions keep their value.
     let heartbeat_recv_timeout = Arc::new(AtomicU64::new(initial_heartbeat_recv_timeout));
     let probe_idle_timeout = Arc::new(AtomicU64::new(initial_probe_idle_timeout));
 
