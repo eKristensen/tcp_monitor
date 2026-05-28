@@ -7,6 +7,16 @@ BIN="${TCP_MONITOR_BIN:-./target/release/tcp-monitor}"
 
 sudo cp "$BIN" /usr/local/bin/tcp-monitor
 sudo mkdir -p /etc/tcp-monitor
-printf '[node]\nname = "ci"\n[server]\nbind = "0.0.0.0"\nport = 9700\nmetrics_port = 9701\nprobe_port = 9702\nrecv_timeout = 90\n' | sudo tee /etc/tcp-monitor/config.toml > /dev/null
+sudo tee /etc/tcp-monitor/config.toml > /dev/null << 'TOML'
+[node]
+name = "ci"
+
+[server]
+bind         = "0.0.0.0"
+port         = 9700
+metrics_port = 9701
+probe_port   = 9702
+recv_timeout = 90
+TOML
 systemd-analyze verify tcp-monitor.service
 echo "systemd unit validation passed"
