@@ -7,7 +7,6 @@ mod protocol;
 mod server;
 
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
-use clap::Parser;
 use prometheus_client::encoding::text::encode;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,13 +14,6 @@ use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
-
-#[derive(Parser)]
-#[command(about = "TCP session longevity monitor")]
-struct Args {
-    #[arg(long, default_value = "/etc/tcp-monitor/config.toml")]
-    config: PathBuf,
-}
 
 #[tokio::main]
 async fn main() {
@@ -32,9 +24,9 @@ async fn main() {
         )
         .init();
 
-    let args = Args::parse();
+    let config_path = parse_config_path();
 
-    let initial_config = match config::load(&args.config) {
+    let initial_config = match config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to load config: {}", e);
@@ -50,7 +42,6 @@ async fn main() {
     // SIGHUP reloads the config file and broadcasts the new version.
     // Errors are logged; the running config is kept untouched on any failure.
     {
-        let config_path = args.config.clone();
         let watcher_tx = config_tx.clone();
         tokio::spawn(async move {
             let mut sighup = match signal(SignalKind::hangup()) {
@@ -110,6 +101,30 @@ async fn main() {
 
     shutdown_signal().await;
     info!("Shutting down");
+}
+
+fn parse_config_path() -> PathBuf {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        None => PathBuf::from("/etc/tcp-monitor/config.toml"),
+        Some("--config") => match args.next() {
+            Some(p) => PathBuf::from(p),
+            None => {
+                eprintln!("error: --config requires a path argument");
+                std::process::exit(1);
+            }
+        },
+        Some("--help" | "-h") => {
+            println!("Usage: tcp-monitor [--config <path>]");
+            println!("  Default config path: /etc/tcp-monitor/config.toml");
+            println!("  Log level:           LOG_LEVEL=debug (env var)");
+            std::process::exit(0);
+        }
+        Some(arg) => {
+            eprintln!("error: unknown argument '{arg}'");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Resolves on SIGTERM or Ctrl-C, whichever comes first.
