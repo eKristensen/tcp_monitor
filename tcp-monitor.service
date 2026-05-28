@@ -1,0 +1,18 @@
+[Unit]
+Description=TCP Session Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/local/bin/tcp-monitor --config /etc/tcp-monitor/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tcp-monitor
+
+[Install]
+WantedBy=multi-user.target

@@ -1,184 +1,256 @@
 # TCP Session Longevity Monitor
 
-Monitors a single long-lived TCP session between two RHEL9 servers.
-Exposes Prometheus metrics on each side covering session state,
-duration, heartbeat health, and disconnect reasons.
+Monitors long-lived TCP sessions between nodes in a network.  
+Each node runs a single binary that acts as both server and client — a mesh
+of any shape is possible by editing the config file without restarting the service.
+
+Exposes Prometheus metrics on each node covering session state, duration,
+heartbeat health, disconnect reasons, and round-trip time.
 
 ---
 
 ## How it works
 
 ```
-Server1 (server side)          Server2 (client side)
-+-------------------------+    +-------------------------+
-| tcp_monitor_server.py   |    | tcp_monitor_client.py   |
-|                         |    |                         |
-|  TCP test port :9700 <--+----+-- connects              |
-|  metrics :9701          |    |  metrics :9702          |
-|      ^                  |    |      ^                  |
-|   Prometheus            |    |   Prometheus            |
-+-------------------------+    +-------------------------+
+Node A                              Node B
++------------------------------+    +------------------------------+
+| tcp-monitor                  |    | tcp-monitor                  |
+|                              |    |                              |
+|  heartbeat port :9700 <------+----+-- client session             |
+|  client session  --------+   |    |   heartbeat port :9700       |
+|  metrics        :9701    +---+--->+--> (same binary, both roles) |
+|  probe port     :9702        |    |  metrics        :9701        |
+|      ^                       |    |  probe port     :9702        |
+|   Prometheus / Blackbox      |    |      ^                       |
++------------------------------+    |   Prometheus / Blackbox      |
+                                    +------------------------------+
 ```
 
-- The **server** listens on the test port and echoes every heartbeat packet back.
-- The **client** connects, sends a heartbeat every 30 s (configurable), and
-  measures the round-trip time of each echo.
-- Both sides expose `/metrics` on a separate port for local Prometheus scraping.
-- The client reconnects automatically after any disconnect, so data collection
-  continues across multiple sessions.
+- Every node **listens** on the heartbeat port. New clients can connect without
+  any server-side config change or restart.
+- Nodes that have peers configured **connect** as clients, sending a heartbeat
+  every 30 s (configurable) and measuring echo round-trip time.
+- On connect the client sends its **node name**; the server uses this to label
+  per-session metrics, so Prometheus can identify each session by name rather
+  than IP.
+- Adding or removing `[[peers]]` from the config file is picked up live via
+  `systemctl reload tcp-monitor` (SIGHUP) — no restart, no disruption to
+  existing sessions.
+- The **probe port** accepts connections, sends `TCP-MONITOR OK\r\n`, and holds
+  the connection open. Use it with the Prometheus Blackbox Exporter for both
+  TCP establishment and banner-response tests.
+
+---
+
+## Ports (all configurable)
+
+| Port | Purpose |
+|------|---------|
+| 9700 | Heartbeat port — peer clients connect here |
+| 9701 | Prometheus `/metrics` scrape endpoint |
+| 9702 | Blackbox Exporter probe port |
 
 ---
 
 ## Metrics reference
 
-Both sides expose the same metric names. Prometheus differentiates them via
-the `role` and `instance` labels you add in your scrape config.
+All metrics carry `node` (this host's name) and `peer` labels.
+
+### Server-side (inbound sessions)
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `tcp_session_active` | Gauge | 1 while a session is live, 0 otherwise |
-| `tcp_session_start_timestamp_seconds` | Gauge | When the current/last session started (Unix time) |
-| `tcp_session_duration_seconds` | Gauge | Duration of active session, or last completed session |
-| `tcp_sessions_total` | Counter | Total sessions established since startup |
-| `tcp_heartbeats_received_total` | Counter | Heartbeats received (echoes on client, requests on server) |
-| `tcp_session_disconnects_total{reason}` | Counter | Disconnects labelled by reason (see below) |
-| `tcp_last_heartbeat_timestamp_seconds` | Gauge | When the last heartbeat was successfully exchanged |
-| **Client only** | | |
-| `tcp_heartbeats_sent_total` | Counter | Total heartbeats sent |
-| `tcp_heartbeats_missed_total` | Counter | Echoes that did not arrive within the timeout window |
-| `tcp_heartbeats_consecutive_missed` | Gauge | Current run of consecutive misses (resets on success) |
-| `tcp_heartbeat_rtt_seconds` | Gauge | RTT of most recent echo |
+| `tcp_monitor_server_session_active` | Gauge | 1 while a session is live with this peer |
+| `tcp_monitor_server_session_start_timestamp_seconds` | Gauge | When the current/last session started |
+| `tcp_monitor_server_session_duration_seconds` | Gauge | Duration of active or last session |
+| `tcp_monitor_server_sessions_total` | Counter | Total inbound sessions since startup |
+| `tcp_monitor_server_heartbeats_received_total` | Counter | Heartbeat packets received from peer |
+| `tcp_monitor_server_last_heartbeat_timestamp_seconds` | Gauge | Time of most recent heartbeat |
+| `tcp_monitor_server_session_disconnects_total{reason}` | Counter | Disconnects by reason |
+
+### Client-side (outbound sessions)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `tcp_monitor_client_session_active` | Gauge | 1 while a session is live to this peer |
+| `tcp_monitor_client_session_start_timestamp_seconds` | Gauge | When the current/last session started |
+| `tcp_monitor_client_session_duration_seconds` | Gauge | Duration of active or last session |
+| `tcp_monitor_client_sessions_total` | Counter | Total outbound sessions since startup |
+| `tcp_monitor_client_heartbeats_sent_total` | Counter | Heartbeat packets sent |
+| `tcp_monitor_client_heartbeats_received_total` | Counter | Echoes received from peer |
+| `tcp_monitor_client_heartbeats_missed_total` | Counter | Echoes not received within timeout |
+| `tcp_monitor_client_heartbeats_consecutive_missed` | Gauge | Current run of consecutive misses |
+| `tcp_monitor_client_heartbeat_rtt_seconds` | Gauge | RTT of most recent echo |
+| `tcp_monitor_client_last_heartbeat_timestamp_seconds` | Gauge | Time of most recent successful echo |
+| `tcp_monitor_client_session_disconnects_total{reason}` | Counter | Disconnects by reason |
 
 ### Disconnect reasons
 
 | Reason | What it means |
 |--------|---------------|
-| `remote_close` | Remote host sent FIN — deliberate, graceful shutdown of the application |
-| `connection_reset` | RST received — could be remote host (crash, firewall rule) or a network device injecting a RST |
-| `timeout` | No heartbeat/echo for N intervals, and no FIN or RST was ever received — most likely a **silent network drop** (NAT expiry, middlebox, packet loss) |
-| `local_error` | OS error on **this** host — interface down, routing failure, etc. |
-| `connect_failed` | Could not establish the TCP handshake at all (client only) |
+| `remote_close` | Remote sent FIN — deliberate graceful shutdown |
+| `connection_reset` | RST received — remote crash, firewall rule, or network device |
+| `timeout` | No data for N intervals, no FIN or RST — likely **silent network drop** (NAT expiry, middlebox) |
+| `local_error` | OS error on this host — interface down, routing failure |
+| `connect_failed` | Could not complete TCP handshake (client only) |
 
 **Distinguishing network from host:**
-- `timeout` → suspect the **network** (silent drop, no RST was generated by either host)
-- `remote_close` / `connection_reset` → suspect a **host** (OS or application on the remote side acted)
+- `timeout` → suspect the **network**
+- `remote_close` / `connection_reset` → suspect a **host**
 - `local_error` → suspect **this host**
 
 ---
 
 ## Setup
 
-### 1. Deploy the scripts and create the virtualenv (both servers)
+### 1. Build
 
 ```bash
-sudo mkdir -p /opt/tcp-monitor
-sudo cp tcp_monitor_server.py tcp_monitor_client.py /opt/tcp-monitor/
-python3 -m venv /opt/tcp-monitor/venv
-/opt/tcp-monitor/venv/bin/pip install prometheus_client
+cargo build --release
+sudo cp target/release/tcp-monitor /usr/local/bin/tcp-monitor
 ```
 
-Without internet access:
+### 2. Create config
 
 ```bash
-# On a machine with internet, download the wheel:
-pip3 download prometheus_client -d /tmp/prometheus_wheel/
-# Copy /tmp/prometheus_wheel/ to the server, then:
-/opt/tcp-monitor/venv/bin/pip install --no-index --find-links=/tmp/prometheus_wheel/ prometheus_client
+sudo mkdir -p /etc/tcp-monitor
+sudo cp config.example.toml /etc/tcp-monitor/config.toml
+sudo $EDITOR /etc/tcp-monitor/config.toml
 ```
 
-Set permissions so the systemd dynamic user (an ephemeral UID with no group membership)
-can read the files via "other" bits:
+Minimal config (server-only node, no outbound sessions):
 
-```bash
-sudo chmod -R 755 /opt/tcp-monitor   # directories: rwxr-xr-x
-sudo chmod 644 /opt/tcp-monitor/*.py  # scripts: rw-r--r-- (python3 reads, not executes)
+```toml
+[node]
+name = "server1"
+
+[server]
+bind                   = "0.0.0.0"
+port                   = 9700
+metrics_port           = 9701
+probe_port             = 9702
+heartbeat_recv_timeout = 90
+probe_idle_timeout     = 30
+```
+
+To also connect as a client, add:
+
+```toml
+[client]
+heartbeat_interval = 30
+max_misses         = 3
+reconnect_delay    = 10
+
+[[peers]]
+name = "server2"
+host = "192.168.1.2"
 ```
 
 ### 3. Open firewall ports
 
-On **both** servers (adjust zone as needed):
-
 ```bash
-# TCP test port (server needs to accept connections)
-sudo firewall-cmd --permanent --add-port=9700/tcp
-# Prometheus metrics port
-sudo firewall-cmd --permanent --add-port=9701/tcp   # server side
-sudo firewall-cmd --permanent --add-port=9702/tcp   # client side
+# On every node:
+sudo firewall-cmd --permanent --add-port=9700/tcp   # heartbeat
+sudo firewall-cmd --permanent --add-port=9701/tcp   # metrics
+sudo firewall-cmd --permanent --add-port=9702/tcp   # probe
 sudo firewall-cmd --reload
 ```
 
-### 4. Configure and start the services
-
-**On server1 (server side):**
+### 4. Install and start the service
 
 ```bash
-sudo cp tcp-monitor-server.service /etc/systemd/system/
+sudo cp tcp-monitor.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now tcp-monitor-server
-sudo systemctl status tcp-monitor-server
-```
-
-**On server2 (client side):**
-
-Edit `tcp-monitor-client.service` — replace `192.168.1.10` with server1's IP.
-
-```bash
-sudo cp tcp-monitor-client.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now tcp-monitor-client
-sudo systemctl status tcp-monitor-client
+sudo systemctl enable --now tcp-monitor
+sudo systemctl status tcp-monitor
 ```
 
 ### 5. Configure Prometheus
 
-Add the scrape config from `prometheus_scrape_config.yml` to each server's
-`/etc/prometheus/prometheus.yml`, then reload:
-
-```bash
-sudo systemctl reload prometheus
+```yaml
+scrape_configs:
+  - job_name: tcp_monitor
+    static_configs:
+      - targets: ['localhost:9701']
 ```
 
-### 6. Verify
+Because metrics already carry `node` and `peer` labels, no extra relabelling
+is needed to distinguish sessions.
 
-Check the metrics endpoint directly:
+### 6. Configure Blackbox Exporter (optional)
 
-```bash
-curl http://localhost:9701/metrics | grep tcp_   # on server1
-curl http://localhost:9702/metrics | grep tcp_   # on server2
+Copy `blackbox.example.yml` into your Blackbox Exporter config (or merge the
+module into an existing config file):
+
+```yaml
+modules:
+  tcp_monitor_probe:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      query_response:
+        - expect: "TCP-MONITOR OK"
 ```
 
-Check logs:
+This checks both that the TCP connection succeeds and that the binary responds
+with the correct banner — confirming the process is running and reachable.
+
+Prometheus scrape:
+
+```yaml
+- job_name: blackbox_tcp_monitor
+  metrics_path: /probe
+  params:
+    module: [tcp_monitor_banner]
+  static_configs:
+    - targets:
+        - server2.example.com:9702
+  relabel_configs:
+    - source_labels: [__address__]
+      target_label: __param_target
+    - source_labels: [__param_target]
+      target_label: instance
+    - target_label: __address__
+      replacement: localhost:9115   # blackbox exporter address
+```
+
+### 7. Verify
 
 ```bash
-journalctl -u tcp-monitor-server -f   # server1
-journalctl -u tcp-monitor-client -f   # server2
+# Metrics endpoint
+curl http://localhost:9701/metrics | grep tcp_monitor
+
+# Probe port
+nc -w2 localhost 9702   # should print "TCP-MONITOR OK"
+
+# Logs
+journalctl -u tcp-monitor -f
 ```
 
 ---
 
-## Command-line options
+## Adding a new peer (hot-reload)
 
-### tcp_monitor_server.py
+Edit `/etc/tcp-monitor/config.toml` and add a `[[peers]]` block, then run:
 
-```
---bind              IP to bind (default: 0.0.0.0)
---port              TCP test port (default: 9700)
---metrics-port      Prometheus metrics port (default: 9701)
---heartbeat-interval  Expected client heartbeat interval in seconds (default: 30)
---timeout-multiplier  Declare session dead after N × heartbeat-interval with no data (default: 3)
---log-level         DEBUG / INFO / WARNING / ERROR (default: INFO)
+```bash
+sudo systemctl reload tcp-monitor
 ```
 
-### tcp_monitor_client.py
+The service picks up the new peer immediately with no restart. Existing
+sessions are unaffected. If the config has a syntax error the reload is
+rejected and the running config continues — the error is logged to journald.
 
-```
-host                Server hostname or IP (positional, required)
---port              TCP test port (default: 9700)
---metrics-port      Prometheus metrics port (default: 9702)
---heartbeat-interval  Seconds between heartbeats (default: 30)
---max-misses        Consecutive missed echoes before declaring session dead (default: 3)
---reconnect-delay   Seconds to wait before reconnecting (default: 10)
---log-level         DEBUG / INFO / WARNING / ERROR (default: INFO)
+---
+
+## Log level
+
+Set the `LOG_LEVEL` environment variable (e.g. `LOG_LEVEL=debug`) or add it to
+the service file:
+
+```ini
+[Service]
+Environment=LOG_LEVEL=debug
 ```
 
 ---
@@ -187,38 +259,31 @@ host                Server hostname or IP (positional, required)
 
 ```promql
 # Is the session up right now?
-tcp_session_active
+tcp_monitor_client_session_active
 
-# How long has the current/last session been running?
-tcp_session_duration_seconds
-
-# RTT over time (client side)
-tcp_heartbeat_rtt_seconds
+# RTT over time
+tcp_monitor_client_heartbeat_rtt_seconds
 
 # Rate of missed heartbeats (should be 0 on a healthy session)
-rate(tcp_heartbeats_missed_total[5m])
+rate(tcp_monitor_client_heartbeats_missed_total[5m])
 
-# Number of disconnects broken down by reason (all time)
-tcp_session_disconnects_total
+# Disconnect events broken down by reason
+increase(tcp_monitor_client_session_disconnects_total[1h])
 
-# When did the session last drop?
-tcp_session_start_timestamp_seconds
+# How long has the current session been running?
+tcp_monitor_client_session_duration_seconds
+  * on(node, peer) tcp_monitor_client_session_active
 ```
 
 ---
 
 ## Notes
 
-- **Heartbeat data also prevents NAT/firewall expiry.** Many firewalls silently
-  drop long-lived sessions after a period of inactivity. The 30 s heartbeat
-  keeps the session alive through most default NAT/firewall idle timers.
-
-- **TCP keepalives are also enabled** at the OS level as a belt-and-suspenders
-  measure (idle 60 s, probe every 10 s, give up after 6 probes). For an active
-  session with 30 s heartbeats these will rarely fire, but they protect against
-  cases where the application layer stalls.
-
-- **The reconnect loop on the client** means you accumulate a history of
-  sessions over time. Each disconnect reason is a data point; a pattern of
-  `timeout` reasons strongly points to the network, while `connection_reset`
+- **Heartbeats prevent NAT/firewall expiry.** The 30 s heartbeat keeps sessions
+  alive through most default NAT idle timers (typically 5–30 min).
+- **TCP keepalives** are also enabled at the OS level (idle 60 s, probe every
+  10 s, 6 probes) as a belt-and-suspenders measure for detecting dead connections
+  faster than `max_misses × heartbeat_interval` would.
+- **The reconnect loop** means you accumulate a history of sessions over time.
+  A pattern of `timeout` reasons strongly points to the network; `connection_reset`
   or `remote_close` points to a host.

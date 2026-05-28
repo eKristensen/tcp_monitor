@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: Build, lint, and integration tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy -- -D warnings
+
+      - name: Server startup, metrics, and probe test
+        run: ci/server-startup-test.sh
+
+      - name: End-to-end heartbeat test
+        run: ci/e2e-test.sh
+
+      - name: SIGHUP reload tests
+        run: ci/sighup-test.sh
+
+      - name: Validate systemd unit file
+        run: ci/systemd-test.sh

@@ -1,22 +1,8 @@
-# Add this to your prometheus.yml scrape_configs section.
-#
-# Both sides expose metrics locally — each Prometheus instance
-# only scrapes its own exporter.
-#
-# On server1 (prometheus scrapes its own tcp_monitor_server):
+# Add to your prometheus.yml scrape_configs on each node.
+# Because metrics already carry "node" and "peer" labels, no relabelling
+# is needed to distinguish which session is which.
+
 scrape_configs:
   - job_name: tcp_monitor
     static_configs:
       - targets: ['localhost:9701']
-        labels:
-          role: 'server'
-          peer: 'server2'   # label to identify what this side is connected to
-
-# On server2 (prometheus scrapes its own tcp_monitor_client):
-scrape_configs:
-  - job_name: tcp_monitor
-    static_configs:
-      - targets: ['localhost:9702']
-        labels:
-          role: 'client'
-          peer: 'server1'
