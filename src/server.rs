@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Hard cap on concurrent inbound heartbeat sessions.
 /// Protects against resource exhaustion from connection floods.
@@ -200,7 +200,7 @@ async fn probe_accept_loop(listener: TcpListener, sem: Arc<Semaphore>) {
                             Ok(_) => {}
                         }
                     }
-                    info!("Probe connection closed: {}", addr);
+                    debug!("Probe connection closed: {}", addr);
                 });
             }
             Err(e) => {
