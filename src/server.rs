@@ -64,38 +64,53 @@ pub async fn run(args: ServerArgs) {
     let probe_sem = Arc::new(Semaphore::new(MAX_PROBE_CONNECTIONS));
 
     let heartbeat_task = {
-        let node = node_name.clone();
-        let m = metrics.clone();
-        let s = heartbeat_sem.clone();
-        let c = cancel.clone();
-        let rt = recv_timeout.clone();
+        let node_name = node_name.clone();
+        let metrics = metrics.clone();
+        let heartbeat_sem = heartbeat_sem.clone();
+        let cancel = cancel.clone();
+        let recv_timeout = recv_timeout.clone();
         tokio::spawn(async move {
-            heartbeat_accept_loop(listener, rt, node, m, s, c).await;
+            heartbeat_accept_loop(listener, recv_timeout, node_name, metrics, heartbeat_sem, cancel)
+                .await;
         })
     };
 
     let probe_task = {
-        let c = cancel.clone();
-        let pit = probe_idle_timeout.clone();
-        tokio::spawn(probe_accept_loop(probe_listener, probe_sem, pit, c))
+        let cancel = cancel.clone();
+        let probe_idle_timeout = probe_idle_timeout.clone();
+        tokio::spawn(probe_accept_loop(probe_listener, probe_sem, probe_idle_timeout, cancel))
     };
 
     // React to timeout changes from SIGHUP reloads.
-    // bind/port changes require a restart — rebinding a live port is disruptive.
+    // bind/port/probe_port changes require a restart — rebinding a live port is disruptive.
     let config_task = {
-        let c = cancel.clone();
+        let cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     result = config_rx.changed() => {
                         if result.is_err() { break; }
                         let srv = config_rx.borrow_and_update().server.clone();
+                        if srv.bind != bind || srv.port != port {
+                            warn!(
+                                "server.bind/port changed ({}:{} → {}:{}); restart required",
+                                bind, port, srv.bind, srv.port
+                            );
+                        }
+                        if srv.probe_port != probe_port {
+                            warn!(
+                                "server.probe_port changed ({} → {}); restart required",
+                                probe_port, srv.probe_port
+                            );
+                        }
                         recv_timeout.store(srv.recv_timeout, Ordering::Relaxed);
                         probe_idle_timeout.store(srv.probe_idle_timeout, Ordering::Relaxed);
-                        info!("Server timeouts updated: recv={}s probe_idle={}s",
-                            srv.recv_timeout, srv.probe_idle_timeout);
+                        info!(
+                            "Server timeouts updated: recv={}s probe_idle={}s",
+                            srv.recv_timeout, srv.probe_idle_timeout
+                        );
                     }
-                    _ = c.cancelled() => break,
+                    _ = cancel.cancelled() => break,
                 }
             }
         })
