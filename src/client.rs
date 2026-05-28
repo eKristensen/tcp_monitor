@@ -41,19 +41,30 @@ pub async fn run_manager(
             }
         };
 
-        // If ClientConfig changed, cancel all running tasks so they restart with new settings.
-        if last_client_cfg.as_ref() != Some(&client_cfg) {
-            if last_client_cfg.is_some() {
-                info!("ClientConfig changed, restarting all peer sessions");
-                let drained: Vec<_> = tasks.drain().collect();
-                for (name, (_, token, handle)) in drained {
-                    info!("Restarting peer session (client config change): {}", name);
-                    token.cancel();
-                    let _ = handle.await;
+        // Warn if [client] settings changed; they apply to new sessions only (restart required).
+        if let Some(ref old_cfg) = last_client_cfg {
+            if old_cfg != &client_cfg {
+                if old_cfg.heartbeat_interval != client_cfg.heartbeat_interval {
+                    warn!(
+                        "client.heartbeat_interval changed ({} → {}); restart required for running sessions",
+                        old_cfg.heartbeat_interval, client_cfg.heartbeat_interval
+                    );
+                }
+                if old_cfg.max_misses != client_cfg.max_misses {
+                    warn!(
+                        "client.max_misses changed ({} → {}); restart required for running sessions",
+                        old_cfg.max_misses, client_cfg.max_misses
+                    );
+                }
+                if old_cfg.reconnect_delay != client_cfg.reconnect_delay {
+                    warn!(
+                        "client.reconnect_delay changed ({} → {}); restart required for running sessions",
+                        old_cfg.reconnect_delay, client_cfg.reconnect_delay
+                    );
                 }
             }
-            last_client_cfg = Some(client_cfg.clone());
         }
+        last_client_cfg = Some(client_cfg.clone());
 
         let new_peers: HashMap<String, PeerConfig> = config
             .peers
@@ -241,27 +252,16 @@ async fn run_session(
             }
             Ok(Err(e)) => break 'session classify_io_error(&e),
             Ok(Ok(echo)) => {
-                if echo.seq != sent_seq {
-                    // Stale or out-of-order echo — count as a miss.
-                    consecutive_missed += 1;
-                    metrics.client_heartbeats_missed.get_or_create(&label).inc();
-                    metrics.client_consecutive_missed.get_or_create(&label).set(consecutive_missed);
-                    warn!(
-                        "Stale echo peer={} got_seq={} expected_seq={} ({}/{})",
-                        peer.name, echo.seq, sent_seq, consecutive_missed, client_cfg.max_misses
-                    );
-                    if consecutive_missed >= client_cfg.max_misses as i64 {
-                        break 'session "timeout";
-                    }
-                } else {
-                    let rtt = now_f64() - send_ts;
-                    consecutive_missed = 0;
-                    let now_ts = now_f64();
-                    metrics.client_heartbeats_rx.get_or_create(&label).inc();
-                    metrics.client_consecutive_missed.get_or_create(&label).set(0);
-                    metrics.client_rtt.get_or_create(&label).set(rtt);
-                    metrics.client_last_heartbeat.get_or_create(&label).set(now_ts);
-                    metrics.client_session_duration.get_or_create(&label).set(now_ts - start_ts);
+                // Any echo confirms the connection is alive.
+                consecutive_missed = 0;
+                let now_ts = now_f64();
+                metrics.client_heartbeats_rx.get_or_create(&label).inc();
+                metrics.client_consecutive_missed.get_or_create(&label).set(0);
+                metrics.client_last_heartbeat.get_or_create(&label).set(now_ts);
+                metrics.client_session_duration.get_or_create(&label).set(now_ts - start_ts);
+                // RTT is only meaningful for the echo matching what we sent.
+                if echo.seq == sent_seq {
+                    metrics.client_rtt.get_or_create(&label).set(now_f64() - send_ts);
                 }
             }
         }
