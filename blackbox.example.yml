@@ -1,0 +1,14 @@
+modules:
+  # Checks that the probe port accepts a TCP connection and responds with
+  # the expected banner.  Use this with the Prometheus Blackbox Exporter.
+  #
+  # Scrape target: <node>:9702
+  # This confirms:
+  #   1. TCP connection is accepted (process is running and port is reachable)
+  #   2. The binary responds with the correct banner (not a rogue listener)
+  tcp_monitor_probe:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      query_response:
+        - expect: "TCP-MONITOR OK"

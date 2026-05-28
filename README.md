@@ -178,18 +178,21 @@ is needed to distinguish sessions.
 
 ### 6. Configure Blackbox Exporter (optional)
 
+Copy `blackbox.example.yml` into your Blackbox Exporter config (or merge the
+module into an existing config file):
+
 ```yaml
 modules:
-  tcp_monitor_connect:
+  tcp_monitor_probe:
     prober: tcp
-    tcp:
-      tls: false
-  tcp_monitor_banner:
-    prober: tcp
+    timeout: 5s
     tcp:
       query_response:
         - expect: "TCP-MONITOR OK"
 ```
+
+This checks both that the TCP connection succeeds and that the binary responds
+with the correct banner — confirming the process is running and reachable.
 
 Prometheus scrape:
 

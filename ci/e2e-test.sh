@@ -38,25 +38,26 @@ port = 19710
 TOML
 
 "$BIN" --config /tmp/e2e-server.toml &
-SRV=$!
+SERVER=$!
 "$BIN" --config /tmp/e2e-client.toml &
-CLI=$!
-trap 'kill "$SRV" "$CLI" 2>/dev/null || true; wait "$SRV" "$CLI" 2>/dev/null || true' EXIT
+CLIENT=$!
+trap 'kill "$SERVER" "$CLIENT" 2>/dev/null || true; wait "$SERVER" "$CLIENT" 2>/dev/null || true' EXIT
 
+# Wait for both metrics ports to be ready before proceeding.
 curl -sf --retry 15 --retry-delay 1 --retry-connrefused http://localhost:19711/metrics > /dev/null
 curl -sf --retry 15 --retry-delay 1 --retry-connrefused http://localhost:19721/metrics > /dev/null
 
 sleep 8  # allow at least 3 heartbeats at 2 s interval
 
-SRV_M=$(curl -sf http://localhost:19711/metrics)
-CLI_M=$(curl -sf http://localhost:19721/metrics)
+SERVER_M=$(curl -sf http://localhost:19711/metrics)
+CLIENT_M=$(curl -sf http://localhost:19721/metrics)
 
-SRV_HB=$(echo "$SRV_M" | grep 'tcp_monitor_server_heartbeats_received_total{node="ci-server",peer="ci-client"}' | awk '{print $2}')
-CLI_HB=$(echo "$CLI_M" | grep 'tcp_monitor_client_heartbeats_received_total{node="ci-client",peer="ci-server"}' | awk '{print $2}')
-RTT=$(echo "$CLI_M"   | grep 'tcp_monitor_client_heartbeat_rtt_seconds{'                                        | awk '{print $2}')
+SERVER_HB=$(echo "$SERVER_M" | grep 'tcp_monitor_server_heartbeats_received_total{node="ci-server",peer="ci-client"}' | awk '{print $2}')
+CLIENT_HB=$(echo "$CLIENT_M" | grep 'tcp_monitor_client_heartbeats_received_total{node="ci-client",peer="ci-server"}' | awk '{print $2}')
+RTT=$(echo "$CLIENT_M"       | grep 'tcp_monitor_client_heartbeat_rtt_seconds{'                                        | awk '{print $2}')
 
-[[ -n "$SRV_HB" ]] && [[ "${SRV_HB%.*}" -ge 2 ]] || { echo "ERROR: server heartbeats=$SRV_HB"; echo "$SRV_M"; exit 1; }
-[[ -n "$CLI_HB" ]] && [[ "${CLI_HB%.*}" -ge 2 ]] || { echo "ERROR: client heartbeats=$CLI_HB"; echo "$CLI_M"; exit 1; }
-[[ -n "$RTT"    ]] && [[ "$RTT" != "0"           ]] || { echo "ERROR: RTT=$RTT"; exit 1; }
+[[ -n "$SERVER_HB" ]] && [[ "${SERVER_HB%.*}" -ge 2 ]] || { echo "ERROR: server heartbeats=$SERVER_HB"; echo "$SERVER_M"; exit 1; }
+[[ -n "$CLIENT_HB" ]] && [[ "${CLIENT_HB%.*}" -ge 2 ]] || { echo "ERROR: client heartbeats=$CLIENT_HB"; echo "$CLIENT_M"; exit 1; }
+[[ -n "$RTT"       ]] && [[ "$RTT" != "0"             ]] || { echo "ERROR: RTT=$RTT"; exit 1; }
 
-echo "E2E test passed (srv_hb=$SRV_HB cli_hb=$CLI_HB rtt=$RTT)"
+echo "E2E test passed (server_hb=$SERVER_HB client_hb=$CLIENT_HB rtt=$RTT)"

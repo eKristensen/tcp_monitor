@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Smoke test: server-only mode.
+# Server startup test: server-only mode.
 # Checks that /metrics responds and the probe port sends the right banner.
-# Run from the repository root: ci/smoke-test.sh
+# Run from the repository root: ci/server-startup-test.sh
 set -euo pipefail
 
 BIN="${TCP_MONITOR_BIN:-./target/release/tcp-monitor}"
 
-cat > /tmp/smoke.toml << 'TOML'
+cat > /tmp/server-startup.toml << 'TOML'
 [node]
-name = "ci-smoke"
+name = "ci-startup"
 [server]
 bind         = "0.0.0.0"
 port         = 19700
@@ -17,10 +17,13 @@ probe_port   = 19702
 recv_timeout = 10
 TOML
 
-"$BIN" --config /tmp/smoke.toml &
+"$BIN" --config /tmp/server-startup.toml &
 PID=$!
 trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true' EXIT
 
+# Wait for the metrics port to be ready before proceeding.
+# -s: silent  -f: fail on HTTP error  --retry-connrefused: also retry on ECONNREFUSED
+# (the process may not have bound the port yet when this runs)
 curl -sf --retry 15 --retry-delay 1 --retry-connrefused \
   http://localhost:19701/metrics > /dev/null
 
@@ -36,4 +39,4 @@ PYEOF
 )
 
 [[ "$BANNER" == "TCP-MONITOR OK" ]] || { echo "ERROR: banner='$BANNER'"; exit 1; }
-echo "Smoke test passed"
+echo "Server startup test passed"
