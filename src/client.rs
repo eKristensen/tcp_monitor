@@ -103,7 +103,7 @@ async fn run_peer_loop(
                     peer: peer.name.clone(),
                     reason: "connect_failed".to_string(),
                 };
-                metrics.clt_disconnects.get_or_create(&label).inc();
+                metrics.client_disconnects.get_or_create(&label).inc();
                 let sleep = tokio::time::sleep(Duration::from_secs(client_cfg.reconnect_delay));
                 tokio::select! {
                     _ = sleep => {},
@@ -156,10 +156,10 @@ async fn run_session(
     let start_ts = now_f64();
     info!("Session established to {}", peer.name);
 
-    metrics.clt_session_active.get_or_create(&label).set(1);
-    metrics.clt_session_start.get_or_create(&label).set(start_ts);
-    metrics.clt_sessions_total.get_or_create(&label).inc();
-    metrics.clt_consecutive_missed.get_or_create(&label).set(0);
+    metrics.client_session_active.get_or_create(&label).set(1);
+    metrics.client_session_start.get_or_create(&label).set(start_ts);
+    metrics.client_sessions_total.get_or_create(&label).inc();
+    metrics.client_consecutive_missed.get_or_create(&label).set(0);
 
     let heartbeat_interval = Duration::from_secs(client_cfg.heartbeat_interval);
     let echo_timeout = heartbeat_interval;
@@ -186,7 +186,7 @@ async fn run_session(
             Ok(ts) => ts,
             Err(e) => break 'session classify_io_error(&e),
         };
-        metrics.clt_heartbeats_sent.get_or_create(&label).inc();
+        metrics.client_heartbeats_sent.get_or_create(&label).inc();
         seq += 1;
 
         // Wait for echo.
@@ -198,8 +198,8 @@ async fn run_session(
         match echo_result {
             Err(_timeout) => {
                 consecutive_missed += 1;
-                metrics.clt_heartbeats_missed.get_or_create(&label).inc();
-                metrics.clt_consecutive_missed.get_or_create(&label).set(consecutive_missed);
+                metrics.client_heartbeats_missed.get_or_create(&label).inc();
+                metrics.client_consecutive_missed.get_or_create(&label).set(consecutive_missed);
                 warn!(
                     "Heartbeat timeout peer={} ({}/{})",
                     peer.name, consecutive_missed, client_cfg.max_misses
@@ -213,21 +213,21 @@ async fn run_session(
                 let rtt = now_f64() - send_ts;
                 consecutive_missed = 0;
                 let now_ts = now_f64();
-                metrics.clt_heartbeats_rx.get_or_create(&label).inc();
-                metrics.clt_consecutive_missed.get_or_create(&label).set(0);
-                metrics.clt_rtt.get_or_create(&label).set(rtt);
-                metrics.clt_last_heartbeat.get_or_create(&label).set(now_ts);
-                metrics.clt_session_duration.get_or_create(&label).set(now_ts - start_ts);
+                metrics.client_heartbeats_rx.get_or_create(&label).inc();
+                metrics.client_consecutive_missed.get_or_create(&label).set(0);
+                metrics.client_rtt.get_or_create(&label).set(rtt);
+                metrics.client_last_heartbeat.get_or_create(&label).set(now_ts);
+                metrics.client_session_duration.get_or_create(&label).set(now_ts - start_ts);
             }
         }
     };
 
     let duration = now_f64() - start_ts;
-    metrics.clt_session_active.get_or_create(&label).set(0);
-    metrics.clt_session_duration.get_or_create(&label).set(duration);
+    metrics.client_session_active.get_or_create(&label).set(0);
+    metrics.client_session_duration.get_or_create(&label).set(duration);
 
     if reason != "cancelled" {
-        metrics.clt_disconnects.get_or_create(&DisconnectLabel {
+        metrics.client_disconnects.get_or_create(&DisconnectLabel {
             node: node_name.to_string(),
             peer: peer.name.clone(),
             reason: reason.to_string(),

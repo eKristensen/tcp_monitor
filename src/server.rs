@@ -109,17 +109,17 @@ async fn handle_connection(
     metrics.init_disconnect_labels(&node_name, &peer_name);
 
     let start_ts = now_f64();
-    metrics.srv_session_active.get_or_create(&label).set(1);
-    metrics.srv_session_start.get_or_create(&label).set(start_ts);
-    metrics.srv_sessions_total.get_or_create(&label).inc();
+    metrics.server_session_active.get_or_create(&label).set(1);
+    metrics.server_session_start.get_or_create(&label).set(start_ts);
+    metrics.server_sessions_total.get_or_create(&label).inc();
 
     let reason = drive_session(&mut stream, recv_timeout, &label, &metrics, start_ts).await;
 
     let duration = now_f64() - start_ts;
-    metrics.srv_session_active.get_or_create(&label).set(0);
-    metrics.srv_session_duration.get_or_create(&label).set(duration);
+    metrics.server_session_active.get_or_create(&label).set(0);
+    metrics.server_session_duration.get_or_create(&label).set(duration);
     metrics
-        .srv_disconnects
+        .server_disconnects
         .get_or_create(&DisconnectLabel {
             node: node_name,
             peer: peer_name.clone(),
@@ -156,10 +156,10 @@ async fn drive_session(
             Ok(Err(_)) => return "local_error",
             Ok(Ok(hb)) => {
                 let now = now_f64();
-                metrics.srv_heartbeats_rx.get_or_create(label).inc();
-                metrics.srv_last_heartbeat.get_or_create(label).set(now);
+                metrics.server_heartbeats_rx.get_or_create(label).inc();
+                metrics.server_last_heartbeat.get_or_create(label).set(now);
                 metrics
-                    .srv_session_duration
+                    .server_session_duration
                     .get_or_create(label)
                     .set(now - start_ts);
 
