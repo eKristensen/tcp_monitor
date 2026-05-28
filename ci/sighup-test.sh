@@ -14,7 +14,7 @@ cat > /tmp/sighup.toml << 'TOML'
 name = "ci-reload"
 [server]
 bind         = "0.0.0.0"
-port         = 19730
+heartbeat_port = 19730
 metrics_port = 19731
 probe_port   = 19732
 heartbeat_recv_timeout = 10
@@ -40,7 +40,7 @@ cat > /tmp/badcfg.toml << 'TOML'
 name = "ci-badcfg"
 [server]
 bind         = "0.0.0.0"
-port         = 19740
+heartbeat_port = 19740
 metrics_port = 19741
 probe_port   = 19742
 heartbeat_recv_timeout = 10

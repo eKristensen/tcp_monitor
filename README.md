@@ -126,7 +126,7 @@ name = "server1"
 
 [server]
 bind                   = "0.0.0.0"
-port                   = 9700
+heartbeat_port         = 9700
 probe_port             = 9701
 metrics_port           = 9702
 heartbeat_recv_timeout = 90

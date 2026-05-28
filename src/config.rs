@@ -19,7 +19,7 @@ pub struct NodeConfig {
 #[derive(Deserialize, Clone, Debug)]
 pub struct ServerConfig {
     pub bind: String,
-    pub port: u16,
+    pub heartbeat_port: u16,
     pub metrics_port: u16,
     pub probe_port: u16,
     pub heartbeat_recv_timeout: u64,
@@ -40,11 +40,11 @@ pub struct ClientConfig {
 pub struct PeerConfig {
     pub name: String,
     pub host: String,
-    #[serde(default = "default_peer_port")]
-    pub port: u16,
+    #[serde(default = "default_peer_heartbeat_port")]
+    pub heartbeat_port: u16,
 }
 
-fn default_peer_port() -> u16 {
+fn default_peer_heartbeat_port() -> u16 {
     9700
 }
 fn default_heartbeat_interval() -> u64 {
@@ -73,7 +73,7 @@ impl Config {
         }
 
         let ports = [
-            ("port", self.server.port),
+            ("heartbeat_port", self.server.heartbeat_port),
             ("metrics_port", self.server.metrics_port),
             ("probe_port", self.server.probe_port),
         ];

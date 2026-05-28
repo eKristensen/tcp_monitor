@@ -91,7 +91,7 @@ async fn main() {
         let srv = initial_config.server.clone();
         tokio::spawn(server::run(server::ServerArgs {
             bind: srv.bind,
-            port: srv.port,
+            heartbeat_port: srv.heartbeat_port,
             probe_port: srv.probe_port,
             heartbeat_recv_timeout: srv.heartbeat_recv_timeout,
             probe_idle_timeout: srv.probe_idle_timeout,

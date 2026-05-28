@@ -129,7 +129,7 @@ async fn run_peer_loop(
     metrics.init_disconnect_labels(&node_name, &peer.name);
 
     loop {
-        let addr = format!("{}:{}", peer.host, peer.port);
+        let addr = format!("{}:{}", peer.host, peer.heartbeat_port);
 
         let connect_result = tokio::select! {
             r = TcpStream::connect(&addr) => r,
