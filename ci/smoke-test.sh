@@ -10,6 +10,7 @@ cat > /tmp/smoke.toml << 'TOML'
 [node]
 name = "ci-smoke"
 [server]
+bind         = "0.0.0.0"
 port         = 19700
 metrics_port = 19701
 probe_port   = 19702

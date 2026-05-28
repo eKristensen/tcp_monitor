@@ -13,6 +13,7 @@ cat > /tmp/sighup.toml << 'TOML'
 [node]
 name = "ci-reload"
 [server]
+bind         = "0.0.0.0"
 port         = 19730
 metrics_port = 19731
 probe_port   = 19732
@@ -37,6 +38,7 @@ cat > /tmp/badcfg.toml << 'TOML'
 [node]
 name = "ci-badcfg"
 [server]
+bind         = "0.0.0.0"
 port         = 19740
 metrics_port = 19741
 probe_port   = 19742

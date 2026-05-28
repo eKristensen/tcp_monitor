@@ -11,6 +11,7 @@ cat > /tmp/e2e-server.toml << 'TOML'
 [node]
 name = "ci-server"
 [server]
+bind         = "0.0.0.0"
 port         = 19710
 metrics_port = 19711
 probe_port   = 19712
@@ -21,6 +22,7 @@ cat > /tmp/e2e-client.toml << 'TOML'
 [node]
 name = "ci-client"
 [server]
+bind         = "0.0.0.0"
 port         = 19720
 metrics_port = 19721
 probe_port   = 19722
