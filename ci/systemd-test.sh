@@ -16,7 +16,8 @@ bind         = "0.0.0.0"
 port         = 9700
 metrics_port = 9701
 probe_port   = 9702
-recv_timeout = 90
+heartbeat_recv_timeout = 90
+probe_idle_timeout     = 30
 TOML
 systemd-analyze verify tcp-monitor.service
 echo "systemd unit validation passed"

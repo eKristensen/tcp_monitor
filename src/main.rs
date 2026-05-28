@@ -93,7 +93,7 @@ async fn main() {
             bind: srv.bind,
             port: srv.port,
             probe_port: srv.probe_port,
-            recv_timeout: srv.recv_timeout,
+            heartbeat_recv_timeout: srv.heartbeat_recv_timeout,
             probe_idle_timeout: srv.probe_idle_timeout,
             node_name: initial_config.node.name.clone(),
             metrics: metrics.clone(),

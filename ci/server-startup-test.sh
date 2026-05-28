@@ -14,7 +14,8 @@ bind         = "0.0.0.0"
 port         = 19700
 metrics_port = 19701
 probe_port   = 19702
-recv_timeout = 10
+heartbeat_recv_timeout = 10
+probe_idle_timeout     = 10
 TOML
 
 "$BIN" --config /tmp/server-startup.toml &

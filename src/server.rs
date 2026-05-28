@@ -19,7 +19,7 @@ pub struct ServerArgs {
     pub bind: String,
     pub port: u16,
     pub probe_port: u16,
-    pub recv_timeout: u64,
+    pub heartbeat_recv_timeout: u64,
     pub probe_idle_timeout: u64,
     pub node_name: String,
     pub metrics: Arc<Metrics>,
@@ -32,7 +32,7 @@ pub async fn run(args: ServerArgs) {
         bind,
         port,
         probe_port,
-        recv_timeout: initial_recv_timeout,
+        heartbeat_recv_timeout: initial_heartbeat_recv_timeout,
         probe_idle_timeout: initial_probe_idle_timeout,
         node_name,
         metrics,
@@ -57,7 +57,7 @@ pub async fn run(args: ServerArgs) {
     info!("Probe port listening on {}", probe_addr);
 
     // Atomics shared with accept loops so SIGHUP reloads take effect for new sessions.
-    let recv_timeout = Arc::new(AtomicU64::new(initial_recv_timeout));
+    let heartbeat_recv_timeout = Arc::new(AtomicU64::new(initial_heartbeat_recv_timeout));
     let probe_idle_timeout = Arc::new(AtomicU64::new(initial_probe_idle_timeout));
 
     let heartbeat_sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -68,10 +68,17 @@ pub async fn run(args: ServerArgs) {
         let metrics = metrics.clone();
         let heartbeat_sem = heartbeat_sem.clone();
         let cancel = cancel.clone();
-        let recv_timeout = recv_timeout.clone();
+        let heartbeat_recv_timeout = heartbeat_recv_timeout.clone();
         tokio::spawn(async move {
-            heartbeat_accept_loop(listener, recv_timeout, node_name, metrics, heartbeat_sem, cancel)
-                .await;
+            heartbeat_accept_loop(
+                listener,
+                heartbeat_recv_timeout,
+                node_name,
+                metrics,
+                heartbeat_sem,
+                cancel,
+            )
+            .await;
         })
     };
 
@@ -103,11 +110,12 @@ pub async fn run(args: ServerArgs) {
                                 probe_port, srv.probe_port
                             );
                         }
-                        recv_timeout.store(srv.recv_timeout, Ordering::Relaxed);
+                        heartbeat_recv_timeout
+                            .store(srv.heartbeat_recv_timeout, Ordering::Relaxed);
                         probe_idle_timeout.store(srv.probe_idle_timeout, Ordering::Relaxed);
                         info!(
-                            "Server timeouts updated: recv={}s probe_idle={}s",
-                            srv.recv_timeout, srv.probe_idle_timeout
+                            "Server timeouts updated: heartbeat_recv={}s probe_idle={}s",
+                            srv.heartbeat_recv_timeout, srv.probe_idle_timeout
                         );
                     }
                     _ = cancel.cancelled() => break,
@@ -126,7 +134,7 @@ pub async fn run(args: ServerArgs) {
 
 async fn heartbeat_accept_loop(
     listener: TcpListener,
-    recv_timeout: Arc<AtomicU64>,
+    heartbeat_recv_timeout: Arc<AtomicU64>,
     node_name: String,
     metrics: Arc<Metrics>,
     sem: Arc<Semaphore>,
@@ -149,12 +157,13 @@ async fn heartbeat_accept_loop(
                         continue;
                     }
                 };
-                let node = node_name.clone();
-                let m = metrics.clone();
-                let rt = recv_timeout.load(Ordering::Relaxed);
+                let node_name = node_name.clone();
+                let metrics = metrics.clone();
+                let heartbeat_recv_timeout = heartbeat_recv_timeout.load(Ordering::Relaxed);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    handle_connection(stream, peer_addr, rt, node, m).await;
+                    handle_connection(stream, peer_addr, heartbeat_recv_timeout, node_name, metrics)
+                        .await;
                 });
             }
             Err(e) => {
@@ -168,7 +177,7 @@ async fn heartbeat_accept_loop(
 async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
-    recv_timeout: u64,
+    heartbeat_recv_timeout: u64,
     node_name: String,
     metrics: Arc<Metrics>,
 ) {
@@ -201,7 +210,8 @@ async fn handle_connection(
     metrics.server_session_start.get_or_create(&label).set(start_ts);
     metrics.server_sessions_total.get_or_create(&label).inc();
 
-    let reason = drive_session(&mut stream, recv_timeout, &label, &metrics, start_ts).await;
+    let reason =
+        drive_session(&mut stream, heartbeat_recv_timeout, &label, &metrics, start_ts).await;
 
     let duration = now_f64() - start_ts;
     metrics.server_session_active.get_or_create(&label).set(0);
@@ -223,14 +233,14 @@ async fn handle_connection(
 
 async fn drive_session(
     stream: &mut TcpStream,
-    recv_timeout: u64,
+    heartbeat_recv_timeout: u64,
     label: &PeerLabel,
     metrics: &Metrics,
     start_ts: f64,
 ) -> &'static str {
     loop {
         let result = tokio::time::timeout(
-            Duration::from_secs(recv_timeout),
+            Duration::from_secs(heartbeat_recv_timeout),
             protocol::recv_heartbeat(stream),
         )
         .await;

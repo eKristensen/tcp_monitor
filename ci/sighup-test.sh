@@ -17,7 +17,8 @@ bind         = "0.0.0.0"
 port         = 19730
 metrics_port = 19731
 probe_port   = 19732
-recv_timeout = 10
+heartbeat_recv_timeout = 10
+probe_idle_timeout     = 10
 TOML
 
 "$BIN" --config /tmp/sighup.toml &
@@ -42,7 +43,8 @@ bind         = "0.0.0.0"
 port         = 19740
 metrics_port = 19741
 probe_port   = 19742
-recv_timeout = 10
+heartbeat_recv_timeout = 10
+probe_idle_timeout     = 10
 TOML
 
 "$BIN" --config /tmp/badcfg.toml &

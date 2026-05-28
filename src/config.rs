@@ -22,9 +22,7 @@ pub struct ServerConfig {
     pub port: u16,
     pub metrics_port: u16,
     pub probe_port: u16,
-    pub recv_timeout: u64,
-    /// Seconds before a probe connection that never closes is dropped.
-    #[serde(default = "default_probe_idle_timeout")]
+    pub heartbeat_recv_timeout: u64,
     pub probe_idle_timeout: u64,
 }
 
@@ -46,9 +44,6 @@ pub struct PeerConfig {
     pub port: u16,
 }
 
-fn default_probe_idle_timeout() -> u64 {
-    30
-}
 fn default_peer_port() -> u16 {
     9700
 }
@@ -95,8 +90,8 @@ impl Config {
             }
         }
 
-        if self.server.recv_timeout == 0 {
-            return Err("server.recv_timeout must be at least 1".to_string());
+        if self.server.heartbeat_recv_timeout == 0 {
+            return Err("server.heartbeat_recv_timeout must be at least 1".to_string());
         }
 
         if let Some(ref c) = self.client {

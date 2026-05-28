@@ -125,11 +125,12 @@ Minimal config (server-only node, no outbound sessions):
 name = "server1"
 
 [server]
-bind         = "0.0.0.0"
-port         = 9700
-metrics_port = 9701
-probe_port   = 9702
-recv_timeout = 90
+bind                   = "0.0.0.0"
+port                   = 9700
+metrics_port           = 9701
+probe_port             = 9702
+heartbeat_recv_timeout = 90
+probe_idle_timeout     = 30
 ```
 
 To also connect as a client, add:

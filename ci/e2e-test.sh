@@ -15,7 +15,8 @@ bind         = "0.0.0.0"
 port         = 19710
 metrics_port = 19711
 probe_port   = 19712
-recv_timeout = 10
+heartbeat_recv_timeout = 10
+probe_idle_timeout     = 10
 TOML
 
 cat > /tmp/e2e-client.toml << 'TOML'
@@ -26,7 +27,8 @@ bind         = "0.0.0.0"
 port         = 19720
 metrics_port = 19721
 probe_port   = 19722
-recv_timeout = 10
+heartbeat_recv_timeout = 10
+probe_idle_timeout     = 10
 [client]
 heartbeat_interval = 2
 max_misses         = 3

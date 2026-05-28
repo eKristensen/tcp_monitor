@@ -1,7 +1,8 @@
 # tcp-monitor configuration
 # Copy to /etc/tcp-monitor/config.toml and edit for each node.
-# The binary watches this file with inotify; saving it adds/removes peer
-# sessions without restarting the service.
+# Run "systemctl reload tcp-monitor" (SIGHUP) to apply peer changes live.
+# Changes to [server] bind/port/probe_port/metrics_port and [client] timing
+# require a full restart.
 
 [node]
 # Unique name for this node. Appears as the "node" label in all metrics,
@@ -9,12 +10,12 @@
 name = "server1"
 
 [server]
-# All fields are optional; these are the defaults.
-bind            = "0.0.0.0"
-port            = 9700   # heartbeat port (clients connect here)
-metrics_port    = 9701   # Prometheus scrape endpoint  GET /metrics
-probe_port      = 9702   # Blackbox Exporter probe port (sends "TCP-MONITOR OK\r\n")
-recv_timeout    = 90     # seconds with no heartbeat before session is declared timed out
+bind                   = "0.0.0.0"
+port                   = 9700   # heartbeat port (clients connect here)
+metrics_port           = 9701   # Prometheus scrape endpoint  GET /metrics
+probe_port             = 9702   # Blackbox Exporter probe port (sends "TCP-MONITOR OK\r\n")
+heartbeat_recv_timeout = 90     # seconds with no heartbeat before a server session is declared timed out
+probe_idle_timeout     = 30     # seconds before a probe connection that never closes is dropped
 
 # Optional: connect to these peers as a client.
 # Remove the [client] section and all [[peers]] entries to run as server-only.
@@ -26,8 +27,9 @@ reconnect_delay    = 10   # seconds to wait before reconnecting after a disconne
 [[peers]]
 name = "server2"
 host = "192.168.1.2"
-port = 9700   # optional, defaults to 9700
+port = 9700
 
 [[peers]]
 name = "server3"
 host = "192.168.1.3"
+port = 9700
