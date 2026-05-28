@@ -14,6 +14,7 @@ use crate::config::Config;
 pub async fn run_manager(
     metrics: Arc<Metrics>,
     mut config_rx: watch::Receiver<Config>,
+    cancel: CancellationToken,
 ) {
     // peer_name -> (peer config used at spawn time, cancel token, task handle)
     let mut tasks: HashMap<String, (PeerConfig, CancellationToken, tokio::task::JoinHandle<()>)> =
@@ -34,8 +35,9 @@ pub async fn run_manager(
                     let _ = handle.await;
                 }
                 last_client_cfg = None;
-                if config_rx.changed().await.is_err() {
-                    break;
+                tokio::select! {
+                    result = config_rx.changed() => { if result.is_err() { break; } }
+                    _ = cancel.cancelled() => break,
                 }
                 continue;
             }
@@ -104,8 +106,9 @@ pub async fn run_manager(
             }
         }
 
-        if config_rx.changed().await.is_err() {
-            break;
+        tokio::select! {
+            result = config_rx.changed() => { if result.is_err() { break; } }
+            _ = cancel.cancelled() => break,
         }
     }
 

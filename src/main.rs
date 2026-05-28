@@ -103,7 +103,8 @@ async fn main() {
     };
 
     // Client manager (maintains outbound peer sessions; reacts to SIGHUP reloads).
-    let client_handle = tokio::spawn(client::run_manager(metrics.clone(), config_rx));
+    let client_handle =
+        tokio::spawn(client::run_manager(metrics.clone(), config_rx, cancel_token.clone()));
 
     cancel_token_signal().await;
     info!("Shutting down");
