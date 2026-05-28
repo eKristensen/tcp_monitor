@@ -18,10 +18,10 @@ Node A                              Node B
 |                              |    |                              |
 |  heartbeat port :9700 <------+----+-- client session             |
 |  client session  --------+   |    |   heartbeat port :9700       |
-|  metrics        :9701    +---+--->+--> (same binary, both roles) |
-|  probe port     :9702        |    |  metrics        :9701        |
-|      ^                       |    |  probe port     :9702        |
-|   Prometheus / Blackbox      |    |      ^                       |
+|  probe port     :9701    +---+--->+--> (same binary, both roles) |
+|  metrics        :9702        |    |  probe port     :9701        |
+|      ^                       |    |  metrics        :9702        |
+|   Blackbox / Prometheus      |    |      ^                       |
 +------------------------------+    |   Prometheus / Blackbox      |
                                     +------------------------------+
 ```
@@ -47,8 +47,8 @@ Node A                              Node B
 | Port | Purpose |
 |------|---------|
 | 9700 | Heartbeat port — peer clients connect here |
-| 9701 | Prometheus `/metrics` scrape endpoint |
-| 9702 | Blackbox Exporter probe port |
+| 9701 | Blackbox Exporter probe port |
+| 9702 | Prometheus `/metrics` scrape endpoint |
 
 ---
 
@@ -127,8 +127,8 @@ name = "server1"
 [server]
 bind                   = "0.0.0.0"
 port                   = 9700
-metrics_port           = 9701
-probe_port             = 9702
+probe_port             = 9701
+metrics_port           = 9702
 heartbeat_recv_timeout = 90
 probe_idle_timeout     = 30
 ```
@@ -151,8 +151,8 @@ host = "192.168.1.2"
 ```bash
 # On every node:
 sudo firewall-cmd --permanent --add-port=9700/tcp   # heartbeat
-sudo firewall-cmd --permanent --add-port=9701/tcp   # metrics
-sudo firewall-cmd --permanent --add-port=9702/tcp   # probe
+sudo firewall-cmd --permanent --add-port=9701/tcp   # probe
+sudo firewall-cmd --permanent --add-port=9702/tcp   # metrics (local only)
 sudo firewall-cmd --reload
 ```
 
@@ -171,7 +171,7 @@ sudo systemctl status tcp-monitor
 scrape_configs:
   - job_name: tcp_monitor
     static_configs:
-      - targets: ['localhost:9701']
+      - targets: ['localhost:9702']
 ```
 
 Because metrics already carry `node` and `peer` labels, no extra relabelling
@@ -204,7 +204,7 @@ Prometheus scrape:
     module: [tcp_monitor_banner]
   static_configs:
     - targets:
-        - server2.example.com:9702
+        - server2.example.com:9701
   relabel_configs:
     - source_labels: [__address__]
       target_label: __param_target
@@ -218,10 +218,10 @@ Prometheus scrape:
 
 ```bash
 # Metrics endpoint
-curl http://localhost:9701/metrics | grep tcp_monitor
+curl http://localhost:9702/metrics | grep tcp_monitor
 
 # Probe port
-nc -w2 localhost 9702   # should print "TCP-MONITOR OK"
+nc -w2 localhost 9701   # should print "TCP-MONITOR OK"
 
 # Logs
 journalctl -u tcp-monitor -f

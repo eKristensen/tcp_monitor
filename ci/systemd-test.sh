@@ -14,8 +14,8 @@ name = "ci"
 [server]
 bind         = "0.0.0.0"
 port         = 9700
-metrics_port = 9701
-probe_port   = 9702
+probe_port   = 9701
+metrics_port = 9702
 heartbeat_recv_timeout = 90
 probe_idle_timeout     = 30
 TOML

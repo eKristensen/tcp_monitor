@@ -12,8 +12,8 @@ name = "server1"
 [server]
 bind                   = "0.0.0.0"
 port                   = 9700   # heartbeat port (clients connect here)
-metrics_port           = 9701   # Prometheus scrape endpoint  GET /metrics
-probe_port             = 9702   # Blackbox Exporter probe port (sends "TCP-MONITOR OK\r\n")
+probe_port             = 9701   # Blackbox Exporter probe port (sends "TCP-MONITOR OK\r\n")
+metrics_port           = 9702   # Prometheus scrape endpoint  GET /metrics  (local only)
 heartbeat_recv_timeout = 90     # seconds with no heartbeat before a server session is declared timed out
 probe_idle_timeout     = 30     # seconds before a probe connection that never closes is dropped
 
