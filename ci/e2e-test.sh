@@ -11,10 +11,10 @@ cat > /tmp/e2e-server.toml << 'TOML'
 [node]
 name = "ci-server"
 [server]
-bind         = "0.0.0.0"
-port         = 19710
-metrics_port = 19711
-probe_port   = 19712
+bind           = "0.0.0.0"
+heartbeat_port = 19710
+metrics_port   = 19711
+probe_port     = 19712
 heartbeat_recv_timeout = 10
 probe_idle_timeout     = 10
 TOML
@@ -23,10 +23,10 @@ cat > /tmp/e2e-client.toml << 'TOML'
 [node]
 name = "ci-client"
 [server]
-bind         = "0.0.0.0"
-port         = 19720
-metrics_port = 19721
-probe_port   = 19722
+bind           = "0.0.0.0"
+heartbeat_port = 19720
+metrics_port   = 19721
+probe_port     = 19722
 heartbeat_recv_timeout = 10
 probe_idle_timeout     = 10
 [client]
@@ -35,8 +35,8 @@ max_misses         = 3
 reconnect_delay    = 2
 [[peers]]
 name = "ci-server"
-host = "127.0.0.1"
-port = 19710
+host           = "127.0.0.1"
+heartbeat_port = 19710
 TOML
 
 "$BIN" --config /tmp/e2e-server.toml &

@@ -17,7 +17,7 @@ const MAX_PROBE_CONNECTIONS: usize = 32;
 
 pub struct ServerArgs {
     pub bind: String,
-    pub port: u16,
+    pub heartbeat_port: u16,
     pub probe_port: u16,
     pub heartbeat_recv_timeout: u64,
     pub probe_idle_timeout: u64,
@@ -30,7 +30,7 @@ pub struct ServerArgs {
 pub async fn run(args: ServerArgs) {
     let ServerArgs {
         bind,
-        port,
+        heartbeat_port,
         probe_port,
         heartbeat_recv_timeout: initial_heartbeat_recv_timeout,
         probe_idle_timeout: initial_probe_idle_timeout,
@@ -39,7 +39,7 @@ pub async fn run(args: ServerArgs) {
         cancel,
         mut config_rx,
     } = args;
-    let addr: SocketAddr = format!("{}:{}", bind, port)
+    let addr: SocketAddr = format!("{}:{}", bind, heartbeat_port)
         .parse()
         .expect("invalid bind address");
     let probe_addr: SocketAddr = format!("{}:{}", bind, probe_port)
@@ -100,10 +100,10 @@ pub async fn run(args: ServerArgs) {
                     result = config_rx.changed() => {
                         if result.is_err() { break; }
                         let srv = config_rx.borrow_and_update().server.clone();
-                        if srv.bind != bind || srv.port != port {
+                        if srv.bind != bind || srv.heartbeat_port != heartbeat_port {
                             warn!(
-                                "server.bind/port changed ({}:{} → {}:{}); restart required",
-                                bind, port, srv.bind, srv.port
+                                "server.bind/heartbeat_port changed ({}:{} → {}:{}); restart required",
+                                bind, heartbeat_port, srv.bind, srv.heartbeat_port
                             );
                         }
                         if srv.probe_port != probe_port {

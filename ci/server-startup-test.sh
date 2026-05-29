@@ -11,7 +11,7 @@ cat > /tmp/server-startup.toml << 'TOML'
 name = "ci-startup"
 [server]
 bind         = "0.0.0.0"
-port         = 19700
+heartbeat_port = 19700
 metrics_port = 19701
 probe_port   = 19702
 heartbeat_recv_timeout = 10
