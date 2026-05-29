@@ -1,8 +1,12 @@
 [package]
 name = "tcp-monitor"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
+edition = "2021"
+# edition 2024 requires rustc ≥ 1.85; RHEL 9's DNF rust-toolset ships ~1.75.
+# Use edition 2021 to stay compatible with official RHEL package channels.
+# Alternative: compile on a separate build machine and distribute the binary —
+# rustup-installed toolchains are not upgraded by `dnf upgrade`, so a dedicated
+# build host that tracks newer Rust is easier to maintain than per-node rustup.
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time", "io-util"] }
