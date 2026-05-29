@@ -152,7 +152,7 @@ host = "192.168.1.2"
 # On every node:
 sudo firewall-cmd --permanent --add-port=9700/tcp   # heartbeat
 sudo firewall-cmd --permanent --add-port=9701/tcp   # probe
-sudo firewall-cmd --permanent --add-port=9702/tcp   # metrics (local only)
+sudo firewall-cmd --permanent --add-port=9702/tcp   # metrics
 sudo firewall-cmd --reload
 ```
 
