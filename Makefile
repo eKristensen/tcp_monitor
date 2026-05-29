@@ -12,10 +12,17 @@ all: build
 build: check
 	cargo build --release
 
-## check     — verify required tools are present
+MIN_RUSTC := 1.75.0
+
+## check     — verify required tools are present and meet minimum versions
 check:
 	@echo "Checking dependencies..."
 	@command -v cargo >/dev/null 2>&1 || { echo "ERROR: cargo not found."; exit 1; }
+	@RUSTC_VER=$$(rustc --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'); \
+	OLDEST=$$(printf '%s\n%s\n' "$(MIN_RUSTC)" "$$RUSTC_VER" | sort -V | head -1); \
+	[ "$$OLDEST" = "$(MIN_RUSTC)" ] || { \
+		echo "ERROR: rustc $$RUSTC_VER is too old (need >= $(MIN_RUSTC))"; exit 1; \
+	}
 	@echo "  cargo : $$(cargo --version)"
 	@echo "  rustc : $$(rustc --version)"
 	@echo "OK"
