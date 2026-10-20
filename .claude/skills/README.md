@@ -23,12 +23,17 @@ rm -rf .claude/skills/rust-best-practices
 cp -r "$tmp/apollo/skills/rust-best-practices" .claude/skills/
 cp "$tmp/apollo/LICENSE" .claude/skills/rust-best-practices/LICENSE
 
-# Microsoft: all.txt is stored in Git LFS, so rebuild it with their own script
-# (or download https://microsoft.github.io/rust-guidelines/agents/all.txt).
+# Microsoft: all.txt is stored in Git LFS, so rebuild it with their own script.
+# The script output is canonical here. The published/LFS copy can differ by a few
+# bytes from the script output at the same commit, so don't mix the two sources.
 git clone --depth 1 https://github.com/microsoft/rust-guidelines.git "$tmp/ms"
 bash "$tmp/ms/scripts/agents_summary.sh"
 cp "$tmp/ms/src/agents/all.txt" .claude/skills/pragmatic-rust-guidelines/references/all.txt
 ```
 
-Afterwards, update the commit hashes above, check that the guideline IDs listed in
+The vendored `all.txt` is the script output at the commit above, sha256
+`e69533b0541a5d185ad9d8304f5eb5cf4b033135b7046f89c499b6126dced3b6`. Rebuilding at that
+commit must reproduce it exactly.
+
+Afterwards, update the commit hashes and checksum above, check that the guideline IDs listed in
 `pragmatic-rust-guidelines/SKILL.md` still exist, and review the diff before committing.

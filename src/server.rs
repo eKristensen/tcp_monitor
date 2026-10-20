@@ -25,7 +25,7 @@ const MAX_PROBE_CONNECTIONS: usize = 32;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
 /// Banner sent on every probe connection; the Blackbox Exporter module matches it.
-pub const PROBE_BANNER: &[u8] = b"TCP-MONITOR OK\r\n";
+const PROBE_BANNER: &[u8] = b"TCP-MONITOR OK\r\n";
 
 /// The bound heartbeat and probe sockets.
 ///
@@ -50,9 +50,11 @@ impl Listeners {
 }
 
 async fn bind_one(host: &str, port: u16, what: &str) -> io::Result<TcpListener> {
-    TcpListener::bind((host, port))
+    let addr = crate::config::bind_addr(host, port)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    TcpListener::bind(addr)
         .await
-        .map_err(|e| io::Error::new(e.kind(), format!("bind {what} {host}:{port}: {e}")))
+        .map_err(|e| io::Error::new(e.kind(), format!("bind {what} {addr}: {e}")))
 }
 
 #[derive(Debug)]

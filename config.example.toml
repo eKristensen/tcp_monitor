@@ -10,7 +10,7 @@
 name = "server1"
 
 [server]
-bind                   = "0.0.0.0"
+bind                   = "0.0.0.0"   # literal IP only; IPv6 in brackets, e.g. "[::]"
 heartbeat_port         = 9700   # port where peer clients connect
 probe_port             = 9701   # Blackbox Exporter probe port (sends "TCP-MONITOR OK\r\n")
 metrics_port           = 9702   # Prometheus scrape endpoint  GET /metrics  (local only)

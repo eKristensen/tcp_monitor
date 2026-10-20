@@ -27,9 +27,13 @@ not just tiny ones. Report "small works / large works" as two separate answers.
      packets still pass. The session looks alive, but bulk transfers stall. This is the failure
      worth detecting.
   3. A middlebox clamps the MSS during the handshake, and everything works at the smaller size.
-- Real IP fragmentation only happens with UDP, or with DF cleared on the socket. Many cloud
-  networks and middleboxes handle fragments poorly. Testing it would need a UDP port (a new
-  firewall rule) or unsafe socket options.
+- The endpoints' own packets are only IP-fragmented with UDP, or with DF cleared on the
+  socket. Testing that would need a UDP port (a new firewall rule) or unsafe socket options.
+  Note, though, that "DF set" does not mean "no fragments anywhere on the path": an overlay
+  tunnel (VXLAN/GENEVE/GRE) that doesn't copy DF to the outer header may fragment the
+  *outer* packet when an inner full-size segment plus encapsulation exceeds the underlay MTU.
+  Many cloud networks and middleboxes handle fragments poorly, so that case can show up as
+  loss or poor throughput on full-size segments only.
 
 So a payload of **anything larger than one MSS (more than about 1448 bytes)** is enough to
 exercise full-size packets. A few KiB is plenty; 64 KiB only spreads the same test over more
@@ -102,5 +106,11 @@ it.
   round's echo, so `echo.seq == sent_seq` never matches again and
   `tcp_monitor_client_heartbeat_rtt_seconds` freezes for the rest of the session. Heartbeat
   counts and liveness are still correct. Fix: after reading an echo with a stale seq, keep
-  reading until the current seq arrives or the timeout expires. Add a regression test with a
-  server that delays one echo.
+  reading until the current seq arrives, bounded by the *remaining* echo timeout (otherwise a
+  slow server can starve the send schedule). Add a regression test with a server that delays
+  one echo.
+- **Echo reads are not cancellation-safe.** `timeout(.., recv_heartbeat)` drops a
+  half-finished read when the timeout fires. If a 16-byte packet is split across segments at
+  that instant, the stream desynchronises (seq and timestamp misaligned) for the rest of the
+  session. This predates the RTT bug above (the old `read_exact` had the same property).
+  Fix together with it: read into a per-session buffer that survives the timeout.

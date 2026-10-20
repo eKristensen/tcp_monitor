@@ -263,16 +263,24 @@ mod server_sessions {
         let mut reloaded = server.config_tx.borrow().clone();
         reloaded.server.heartbeat_recv_timeout = 1;
         server.config_tx.send(reloaded).unwrap();
-        // The server applies the reload asynchronously; give it a moment.
-        tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let _stream = connect_as(&server, "cli").await;
-
-        wait_for_metric(
-            &server.metrics,
-            r#"tcp_monitor_server_session_disconnects_total{node="srv",peer="cli",reason="timeout"}"#,
-            |v| v >= 1.0,
-        )
+        // The server applies the reload asynchronously, so keep opening silent
+        // sessions until one times out. Only a session opened after the reload
+        // can: the others got the 600 s timeout and are held open meanwhile.
+        within("a session to pick up the reloaded timeout", async {
+            let mut sessions = Vec::new();
+            loop {
+                sessions.push(connect_as(&server, "cli").await);
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let timeouts = metric(
+                    &server.metrics,
+                    r#"tcp_monitor_server_session_disconnects_total{node="srv",peer="cli",reason="timeout"}"#,
+                );
+                if timeouts.is_some_and(|v| v >= 1.0) {
+                    return;
+                }
+            }
+        })
         .await;
     }
 
@@ -295,12 +303,29 @@ mod probe_port {
         let server = start_server("srv", 10).await;
         let mut stream = TcpStream::connect(server.probe_addr).await.unwrap();
 
-        let mut banner = vec![0u8; server::PROBE_BANNER.len()];
+        // Literal on purpose: blackbox.example.yml matches this exact banner.
+        let expected = b"TCP-MONITOR OK\r\n";
+        let mut banner = vec![0u8; expected.len()];
         within("banner", stream.read_exact(&mut banner))
             .await
             .unwrap();
 
-        assert_eq!(banner, server::PROBE_BANNER);
+        assert_eq!(banner, expected);
+    }
+}
+
+mod listeners {
+    use super::*;
+
+    #[tokio::test]
+    async fn bind_names_the_port_that_is_already_in_use() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = server_config(10);
+        cfg.heartbeat_port = taken.local_addr().unwrap().port();
+
+        let err = server::Listeners::bind(&cfg).await.unwrap_err();
+
+        assert!(err.to_string().contains("heartbeat_port"), "{err}");
     }
 }
 
@@ -331,6 +356,36 @@ mod client_sessions {
             |v| v >= 1.0,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn records_timeout_after_max_misses_when_server_never_echoes() {
+        // A peer that completes the handshake and then never answers: the
+        // silent-network-drop case the monitor exists to detect.
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = silent.local_addr().unwrap();
+        let _held = tokio::spawn(async move {
+            let (mut stream, _) = silent.accept().await.unwrap();
+            protocol::recv_handshake(&mut stream, 5).await.unwrap();
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink).await;
+        });
+
+        let client = start_client("cli", vec![peer("mute", addr)]);
+
+        wait_for_metric(
+            &client.metrics,
+            r#"tcp_monitor_client_session_disconnects_total{node="cli",peer="mute",reason="timeout"}"#,
+            |v| v >= 1.0,
+        )
+        .await;
+        assert_eq!(
+            metric(
+                &client.metrics,
+                r#"tcp_monitor_client_heartbeats_missed_total{node="cli",peer="mute"}"#
+            ),
+            Some(3.0)
+        );
     }
 
     #[tokio::test]
@@ -383,10 +438,13 @@ mod client_reload {
         reloaded.peers.clear();
         client.config_tx.send(reloaded).unwrap();
 
+        // Only "the session ended" is asserted, not the server-side reason:
+        // the client's close is usually a FIN (remote_close), but an RST
+        // (connection_reset) if an unread echo is still buffered.
         wait_for_metric(
             &server.metrics,
-            r#"tcp_monitor_server_session_disconnects_total{node="srv",peer="cli",reason="remote_close"}"#,
-            |v| v >= 1.0,
+            r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
+            |v| v == 0.0,
         )
         .await;
         wait_for_metric(

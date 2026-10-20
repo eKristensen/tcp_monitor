@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::path::Path;
 
 #[derive(Deserialize, Clone, Debug)]
@@ -59,6 +60,22 @@ fn default_reconnect_delay() -> u64 {
     10
 }
 
+/// Combine `server.bind` and a port into a socket address.
+///
+/// `server.bind` must be a literal IP address — IPv6 in brackets, e.g.
+/// `"[::]"` — never a hostname, so the operator knows exactly which address
+/// is bound and startup never waits on DNS.
+///
+/// # Errors
+/// Returns a human-readable message if `host` is not a literal IP address.
+pub fn bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    format!("{host}:{port}").parse().map_err(|e| {
+        format!(
+            "server.bind {host:?} is not an IP address (IPv6 needs brackets, e.g. \"[::]\"): {e}"
+        )
+    })
+}
+
 /// Read, parse, and validate the config file at `path`.
 ///
 /// # Errors
@@ -86,6 +103,8 @@ impl Config {
         if self.node.name.is_empty() {
             return Err("node.name must not be empty".to_string());
         }
+
+        bind_addr(&self.server.bind, 0)?;
 
         let ports = [
             ("heartbeat_port", self.server.heartbeat_port),
@@ -253,6 +272,27 @@ mod tests {
                 "[[peers]]\nname = \"p\"\nhost = \"a\"\n[[peers]]\nname = \"p\"\nhost = \"b\"";
 
             assert!(parse_err(&with(peers)).contains("duplicate peer name"));
+        }
+
+        #[test]
+        fn accepts_bracketed_ipv6_bind() {
+            let text = SERVER_ONLY.replace("\"0.0.0.0\"", "\"[::]\"");
+
+            assert_eq!(parse(&text).unwrap().server.bind, "[::]");
+        }
+
+        #[test]
+        fn rejects_hostname_as_bind() {
+            let text = SERVER_ONLY.replace("\"0.0.0.0\"", "\"localhost\"");
+
+            assert!(parse_err(&text).contains("not an IP address"));
+        }
+
+        #[test]
+        fn rejects_unbracketed_ipv6_bind() {
+            let text = SERVER_ONLY.replace("\"0.0.0.0\"", "\"::\"");
+
+            assert!(parse_err(&text).contains("not an IP address"));
         }
 
         #[test]

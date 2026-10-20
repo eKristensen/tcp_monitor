@@ -260,16 +260,23 @@ mod tests {
 
             metrics.init_disconnect_labels("me", "them");
 
+            // Literal reason lists: these are the documented values in the
+            // README "Disconnect reasons" table that dashboards depend on.
             let text = metrics.encode().unwrap();
-            for reason in SERVER_DISCONNECT_REASONS {
+            let expected = [
+                ("server", "remote_close"),
+                ("server", "connection_reset"),
+                ("server", "timeout"),
+                ("server", "local_error"),
+                ("client", "remote_close"),
+                ("client", "connection_reset"),
+                ("client", "timeout"),
+                ("client", "local_error"),
+                ("client", "connect_failed"),
+            ];
+            for (side, reason) in expected {
                 let line = format!(
-                    "tcp_monitor_server_session_disconnects_total{{node=\"me\",peer=\"them\",reason=\"{reason}\"}} 0"
-                );
-                assert!(text.contains(&line), "missing: {line}");
-            }
-            for reason in CLIENT_DISCONNECT_REASONS {
-                let line = format!(
-                    "tcp_monitor_client_session_disconnects_total{{node=\"me\",peer=\"them\",reason=\"{reason}\"}} 0"
+                    "tcp_monitor_{side}_session_disconnects_total{{node=\"me\",peer=\"them\",reason=\"{reason}\"}} 0"
                 );
                 assert!(text.contains(&line), "missing: {line}");
             }
