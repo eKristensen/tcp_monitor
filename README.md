@@ -287,3 +287,19 @@ tcp_monitor_client_session_duration_seconds
 - **The reconnect loop** means you accumulate a history of sessions over time.
   A pattern of `timeout` reasons strongly points to the network; `connection_reset`
   or `remote_close` points to a host.
+
+---
+
+## Development
+
+```bash
+cargo fmt --check                                   # formatting
+cargo clippy --all-targets --locked -- -D warnings  # strict lint policy (see Cargo.toml [lints])
+cargo test --locked                                 # unit + loopback integration tests
+```
+
+The integration tests in `tests/` run a real server and client on loopback, using ports
+the OS assigns, so they never conflict with a running instance. The scripts in `ci/` test
+the release binary end to end. Minimum supported Rust is 1.85 (`rust-version` in `Cargo.toml`).
+
+Planned work and ideas still being considered are in [TODO.md](TODO.md).
