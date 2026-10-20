@@ -1,16 +1,20 @@
-use crate::config::{ClientConfig, PeerConfig};
+//! Client side: keeps one outbound heartbeat session open per configured peer
+//! and reconciles the set of sessions when the config is reloaded.
+
+use crate::config::{ClientConfig, Config, PeerConfig};
 use crate::metrics::{DisconnectLabel, Metrics, PeerLabel};
-use crate::protocol;
+use crate::{now_f64, protocol};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::config::Config;
-
+/// Maintain outbound sessions to every configured peer until `cancel` fires
+/// or the config sender is dropped. Peers added, removed, or changed in a
+/// reloaded config are started, stopped, or restarted.
 pub async fn run_manager(
     metrics: Arc<Metrics>,
     mut config_rx: watch::Receiver<Config>,
@@ -24,23 +28,20 @@ pub async fn run_manager(
     loop {
         let config = config_rx.borrow_and_update().clone();
         let node_name = config.node.name.clone();
-        let client_cfg = match &config.client {
-            Some(c) => c.clone(),
-            None => {
-                // No client config; cancel any existing tasks and wait for next change.
-                let drained: Vec<_> = tasks.drain().collect();
-                for (name, (_, token, handle)) in drained {
-                    info!("Removing peer session (no [client] config): {}", name);
-                    token.cancel();
-                    let _ = handle.await;
-                }
-                last_client_cfg = None;
-                tokio::select! {
-                    result = config_rx.changed() => { if result.is_err() { break; } }
-                    _ = cancel.cancelled() => break,
-                }
-                continue;
+        let Some(client_cfg) = config.client.clone() else {
+            // No client config; cancel any existing tasks and wait for next change.
+            let drained: Vec<_> = tasks.drain().collect();
+            for (name, (_, token, handle)) in drained {
+                info!("Removing peer session (no [client] config): {}", name);
+                token.cancel();
+                let _ = handle.await;
             }
+            last_client_cfg = None;
+            tokio::select! {
+                result = config_rx.changed() => { if result.is_err() { break; } }
+                () = cancel.cancelled() => break,
+            }
+            continue;
         };
 
         // Warn if [client] settings changed; they apply to new sessions only (restart required).
@@ -77,9 +78,7 @@ pub async fn run_manager(
         // Cancel tasks for peers removed from config or whose address changed.
         let to_remove: Vec<String> = tasks
             .iter()
-            .filter(|(name, (old_peer, _, _))| {
-                new_peers.get(*name) != Some(old_peer)
-            })
+            .filter(|(name, (old_peer, _, _))| new_peers.get(*name) != Some(old_peer))
             .map(|(name, _)| name.clone())
             .collect();
         for name in to_remove {
@@ -98,7 +97,7 @@ pub async fn run_manager(
                     peer.clone(),
                     client_cfg.clone(),
                     node_name.clone(),
-                    metrics.clone(),
+                    Arc::clone(&metrics),
                     token.clone(),
                 ));
                 tasks.insert(name.clone(), (peer.clone(), token, handle));
@@ -108,7 +107,7 @@ pub async fn run_manager(
 
         tokio::select! {
             result = config_rx.changed() => { if result.is_err() { break; } }
-            _ = cancel.cancelled() => break,
+            () = cancel.cancelled() => break,
         }
     }
 
@@ -133,7 +132,7 @@ async fn run_peer_loop(
 
         let connect_result = tokio::select! {
             r = TcpStream::connect(&addr) => r,
-            _ = cancel.cancelled() => return,
+            () = cancel.cancelled() => return,
         };
 
         match connect_result {
@@ -147,31 +146,26 @@ async fn run_peer_loop(
                 metrics.client_disconnects.get_or_create(&label).inc();
                 let sleep = tokio::time::sleep(Duration::from_secs(client_cfg.reconnect_delay));
                 tokio::select! {
-                    _ = sleep => {},
-                    _ = cancel.cancelled() => return,
+                    () = sleep => {},
+                    () = cancel.cancelled() => return,
                 }
-                continue;
             }
             Ok(stream) => {
-                let reason = run_session(
-                    stream,
-                    &peer,
-                    &client_cfg,
-                    &node_name,
-                    &metrics,
-                    &cancel,
-                )
-                .await;
+                let reason =
+                    run_session(stream, &peer, &client_cfg, &node_name, &metrics, &cancel).await;
 
                 if reason == "cancelled" {
                     return;
                 }
 
-                info!("Reconnecting to {} in {}s", peer.name, client_cfg.reconnect_delay);
+                info!(
+                    "Reconnecting to {} in {}s",
+                    peer.name, client_cfg.reconnect_delay
+                );
                 let sleep = tokio::time::sleep(Duration::from_secs(client_cfg.reconnect_delay));
                 tokio::select! {
-                    _ = sleep => {},
-                    _ = cancel.cancelled() => return,
+                    () = sleep => {},
+                    () = cancel.cancelled() => return,
                 }
             }
         }
@@ -193,14 +187,14 @@ async fn run_session(
         return "local_error";
     }
 
-    let label = PeerLabel { node: node_name.to_string(), peer: peer.name.clone() };
+    let label = PeerLabel {
+        node: node_name.to_string(),
+        peer: peer.name.clone(),
+    };
     let start_ts = now_f64();
     info!("Session established to {}", peer.name);
 
-    metrics.client_session_active.get_or_create(&label).set(1);
-    metrics.client_session_start.get_or_create(&label).set(start_ts);
-    metrics.client_sessions_total.get_or_create(&label).inc();
-    metrics.client_consecutive_missed.get_or_create(&label).set(0);
+    record_session_start(metrics, &label, start_ts);
 
     let heartbeat_interval = Duration::from_secs(client_cfg.heartbeat_interval);
     let echo_timeout = heartbeat_interval;
@@ -213,8 +207,8 @@ async fn run_session(
         let now = tokio::time::Instant::now();
         if next_send > now {
             tokio::select! {
-                _ = tokio::time::sleep_until(next_send) => {},
-                _ = cancel.cancelled() => break 'session "cancelled",
+                () = tokio::time::sleep_until(next_send) => {},
+                () = cancel.cancelled() => break 'session "cancelled",
             }
         }
         next_send += heartbeat_interval;
@@ -223,7 +217,7 @@ async fn run_session(
         let sent_seq = seq;
         let send_ts = match tokio::select! {
             r = protocol::send_heartbeat(&mut stream, sent_seq) => r,
-            _ = cancel.cancelled() => break 'session "cancelled",
+            () = cancel.cancelled() => break 'session "cancelled",
         } {
             Ok(ts) => ts,
             Err(e) => break 'session classify_io_error(&e),
@@ -234,19 +228,22 @@ async fn run_session(
         // Wait for echo.
         let echo_result = tokio::select! {
             r = tokio::time::timeout(echo_timeout, protocol::recv_heartbeat(&mut stream)) => r,
-            _ = cancel.cancelled() => break 'session "cancelled",
+            () = cancel.cancelled() => break 'session "cancelled",
         };
 
         match echo_result {
             Err(_timeout) => {
                 consecutive_missed += 1;
                 metrics.client_heartbeats_missed.get_or_create(&label).inc();
-                metrics.client_consecutive_missed.get_or_create(&label).set(consecutive_missed);
+                metrics
+                    .client_consecutive_missed
+                    .get_or_create(&label)
+                    .set(consecutive_missed);
                 warn!(
                     "Heartbeat timeout peer={} ({}/{})",
                     peer.name, consecutive_missed, client_cfg.max_misses
                 );
-                if consecutive_missed >= client_cfg.max_misses as i64 {
+                if consecutive_missed >= i64::from(client_cfg.max_misses) {
                     break 'session "timeout";
                 }
                 // After a timeout, reset the send schedule so the next heartbeat
@@ -257,35 +254,77 @@ async fn run_session(
             Ok(Ok(echo)) => {
                 // Any echo confirms the connection is alive.
                 consecutive_missed = 0;
-                let now_ts = now_f64();
-                metrics.client_heartbeats_rx.get_or_create(&label).inc();
-                metrics.client_consecutive_missed.get_or_create(&label).set(0);
-                metrics.client_last_heartbeat.get_or_create(&label).set(now_ts);
-                metrics.client_session_duration.get_or_create(&label).set(now_ts - start_ts);
                 // RTT is only meaningful for the echo matching what we sent.
-                if echo.seq == sent_seq {
-                    metrics.client_rtt.get_or_create(&label).set(now_f64() - send_ts);
-                }
+                let send_ts = (echo.seq == sent_seq).then_some(send_ts);
+                record_echo(metrics, &label, start_ts, send_ts);
             }
         }
     };
 
     let duration = now_f64() - start_ts;
     metrics.client_session_active.get_or_create(&label).set(0);
-    metrics.client_session_duration.get_or_create(&label).set(duration);
+    metrics
+        .client_session_duration
+        .get_or_create(&label)
+        .set(duration);
 
     if reason != "cancelled" {
-        metrics.client_disconnects.get_or_create(&DisconnectLabel {
-            node: node_name.to_string(),
-            peer: peer.name.clone(),
-            reason: reason.to_string(),
-        }).inc();
-        info!("Session ended peer={} duration={:.1}s reason={}", peer.name, duration, reason);
+        metrics
+            .client_disconnects
+            .get_or_create(&DisconnectLabel {
+                node: node_name.to_string(),
+                peer: peer.name.clone(),
+                reason: reason.to_string(),
+            })
+            .inc();
+        info!(
+            "Session ended peer={} duration={:.1}s reason={}",
+            peer.name, duration, reason
+        );
     }
 
     reason
 }
 
+fn record_session_start(metrics: &Metrics, label: &PeerLabel, start_ts: f64) {
+    metrics.client_session_active.get_or_create(label).set(1);
+    metrics
+        .client_session_start
+        .get_or_create(label)
+        .set(start_ts);
+    metrics.client_sessions_total.get_or_create(label).inc();
+    metrics
+        .client_consecutive_missed
+        .get_or_create(label)
+        .set(0);
+}
+
+/// Record a received echo. `send_ts` is the send time of the matching
+/// heartbeat, or `None` if the echo was for an earlier one (no RTT then).
+fn record_echo(metrics: &Metrics, label: &PeerLabel, start_ts: f64, send_ts: Option<f64>) {
+    let now_ts = now_f64();
+    metrics.client_heartbeats_rx.get_or_create(label).inc();
+    metrics
+        .client_consecutive_missed
+        .get_or_create(label)
+        .set(0);
+    metrics
+        .client_last_heartbeat
+        .get_or_create(label)
+        .set(now_ts);
+    metrics
+        .client_session_duration
+        .get_or_create(label)
+        .set(now_ts - start_ts);
+    if let Some(send_ts) = send_ts {
+        metrics
+            .client_rtt
+            .get_or_create(label)
+            .set(now_ts - send_ts);
+    }
+}
+
+/// Map an I/O error to the disconnect reason reported in metrics.
 fn classify_io_error(e: &std::io::Error) -> &'static str {
     match e.kind() {
         std::io::ErrorKind::ConnectionReset => "connection_reset",
@@ -294,9 +333,35 @@ fn classify_io_error(e: &std::io::Error) -> &'static str {
     }
 }
 
-fn now_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    mod classify_io_error {
+        use super::*;
+
+        #[test]
+        fn maps_reset_to_connection_reset() {
+            assert_eq!(
+                classify_io_error(&Error::from(ErrorKind::ConnectionReset)),
+                "connection_reset"
+            );
+        }
+
+        #[test]
+        fn maps_eof_and_broken_pipe_to_remote_close() {
+            for kind in [ErrorKind::UnexpectedEof, ErrorKind::BrokenPipe] {
+                assert_eq!(classify_io_error(&Error::from(kind)), "remote_close");
+            }
+        }
+
+        #[test]
+        fn maps_anything_else_to_local_error() {
+            assert_eq!(
+                classify_io_error(&Error::from(ErrorKind::NetworkUnreachable)),
+                "local_error"
+            );
+        }
+    }
 }

@@ -12,7 +12,8 @@ all: build
 build: check
 	cargo build --release
 
-MIN_RUSTC := 1.75.0
+# Keep in sync with rust-version in Cargo.toml.
+MIN_RUSTC := 1.85.0
 
 ## check     — verify required tools are present and meet minimum versions
 check:

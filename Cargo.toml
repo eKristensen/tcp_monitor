@@ -2,11 +2,21 @@
 name = "tcp-monitor"
 version = "0.1.0"
 edition = "2021"
-# edition 2024 requires rustc ≥ 1.85; RHEL 9's DNF rust-toolset ships ~1.75.
-# Use edition 2021 to stay compatible with official RHEL package channels.
-# Alternative: compile on a separate build machine and distribute the binary —
-# rustup-installed toolchains are not upgraded by `dnf upgrade`, so a dedicated
-# build host that tracks newer Rust is easier to maintain than per-node rustup.
+# Minimum supported Rust version. This is the real floor imposed by the locked
+# dependencies (axum 0.8 needs 1.80; hashbrown/indexmap via toml need 1.85).
+# CI builds and tests on exactly this version so the claim cannot drift.
+# Edition 2024 would also need 1.85, but stays at 2021 to keep the diff small.
+# Alternative for older RHEL toolchains: compile on a separate build machine and
+# distribute the binary — rustup-installed toolchains are not upgraded by
+# `dnf upgrade`, so a dedicated build host that tracks newer Rust is easier to
+# maintain than per-node rustup.
+rust-version = "1.85"
+description = "Monitors long-lived TCP sessions between nodes and exposes Prometheus metrics"
+license = "MIT"
+repository = "https://github.com/eKristensen/tcp_monitor"
+readme = "README.md"
+keywords = ["tcp", "monitoring", "prometheus", "network", "heartbeat"]
+categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time", "io-util"] }
@@ -17,3 +27,66 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Lint policy. Based on Microsoft's Pragmatic Rust Guidelines (M-STATIC-VERIFICATION)
+# and Apollo's Rust best practices (.claude/skills/). CI runs clippy with
+# `-D warnings`, so every "warn" below fails the build.
+# Suppress a lint only locally, with `#[expect(lint, reason = "...")]`.
+[lints.rust]
+unsafe_code = "forbid"
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+# Transitive dependencies pull in duplicate crate versions we cannot control.
+multiple_crate_versions = "allow"
+
+# Restriction lints: no panicking shortcuts in production code (tests are
+# exempted in clippy.toml).
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+as_conversions = "warn"
+
+# Restriction lints: suppressions must be `#[expect]` with a reason.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
+# Restriction lints from the Microsoft guideline set.
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+deref_by_slicing = "warn"
+disallowed_script_idents = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+fn_to_numeric_cast_any = "warn"
+if_then_some_else_none = "warn"
+map_err_ignore = "warn"
+redundant_type_annotations = "warn"
+renamed_function_params = "warn"
+semicolon_outside_block = "warn"
+undocumented_unsafe_blocks = "warn"
+unneeded_field_pattern = "warn"
+unused_result_ok = "warn"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
