@@ -225,39 +225,52 @@ async fn run_session(
         metrics.client_heartbeats_sent.get_or_create(&label).inc();
         seq += 1;
 
-        // Wait for echo.
-        let echo_result = tokio::select! {
-            r = tokio::time::timeout(echo_timeout, protocol::recv_heartbeat(&mut stream)) => r,
-            () = cancel.cancelled() => break 'session "cancelled",
-        };
-
-        match echo_result {
-            Err(_timeout) => {
-                consecutive_missed += 1;
-                metrics.client_heartbeats_missed.get_or_create(&label).inc();
-                metrics
-                    .client_consecutive_missed
-                    .get_or_create(&label)
-                    .set(consecutive_missed);
-                warn!(
-                    "Heartbeat timeout peer={} ({}/{})",
-                    peer.name, consecutive_missed, client_cfg.max_misses
-                );
-                if consecutive_missed >= i64::from(client_cfg.max_misses) {
-                    break 'session "timeout";
+        // Wait for this heartbeat's echo. An echo for an earlier heartbeat that
+        // arrived after its own timeout is queued ahead of it, so keep reading
+        // until the matching seq or this round's deadline. Stopping at the
+        // first echo would leave every later read one round behind, and RTT
+        // would never be measured again for the rest of the session.
+        let deadline = tokio::time::Instant::now() + echo_timeout;
+        let mut got_echo = false;
+        loop {
+            let echo_result = tokio::select! {
+                r = tokio::time::timeout_at(deadline, protocol::recv_heartbeat(&mut stream)) => r,
+                () = cancel.cancelled() => break 'session "cancelled",
+            };
+            match echo_result {
+                Err(_timeout) => break,
+                Ok(Err(e)) => break 'session classify_io_error(&e),
+                Ok(Ok(echo)) => {
+                    // Any echo, even a late one, confirms the connection is alive.
+                    got_echo = true;
+                    consecutive_missed = 0;
+                    // RTT is only meaningful for the echo matching what we sent.
+                    let matched = echo.seq == sent_seq;
+                    record_echo(metrics, &label, start_ts, matched.then_some(send_ts));
+                    if matched {
+                        break;
+                    }
                 }
-                // After a timeout, reset the send schedule so the next heartbeat
-                // fires after a full interval rather than immediately.
-                next_send = tokio::time::Instant::now() + heartbeat_interval;
             }
-            Ok(Err(e)) => break 'session classify_io_error(&e),
-            Ok(Ok(echo)) => {
-                // Any echo confirms the connection is alive.
-                consecutive_missed = 0;
-                // RTT is only meaningful for the echo matching what we sent.
-                let send_ts = (echo.seq == sent_seq).then_some(send_ts);
-                record_echo(metrics, &label, start_ts, send_ts);
+        }
+
+        if !got_echo {
+            consecutive_missed += 1;
+            metrics.client_heartbeats_missed.get_or_create(&label).inc();
+            metrics
+                .client_consecutive_missed
+                .get_or_create(&label)
+                .set(consecutive_missed);
+            warn!(
+                "Heartbeat timeout peer={} ({}/{})",
+                peer.name, consecutive_missed, client_cfg.max_misses
+            );
+            if consecutive_missed >= i64::from(client_cfg.max_misses) {
+                break 'session "timeout";
             }
+            // After a timeout, reset the send schedule so the next heartbeat
+            // fires after a full interval rather than immediately.
+            next_send = tokio::time::Instant::now() + heartbeat_interval;
         }
     };
 

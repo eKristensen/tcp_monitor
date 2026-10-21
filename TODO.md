@@ -101,16 +101,8 @@ it.
   character; the server then labels the peer `unknown`. Truncate on a character boundary.
 - **Metrics bind address**: the metrics endpoint always binds `0.0.0.0`, ignoring
   `server.bind`.
-- **Bug: RTT stops updating after one late echo.** If an echo arrives after the client's echo
-  timeout, it stays in the receive buffer. From then on, every read returns the *previous*
-  round's echo, so `echo.seq == sent_seq` never matches again and
-  `tcp_monitor_client_heartbeat_rtt_seconds` freezes for the rest of the session. Heartbeat
-  counts and liveness are still correct. Fix: after reading an echo with a stale seq, keep
-  reading until the current seq arrives, bounded by the *remaining* echo timeout (otherwise a
-  slow server can starve the send schedule). Add a regression test with a server that delays
-  one echo.
-- **Echo reads are not cancellation-safe.** `timeout(.., recv_heartbeat)` drops a
-  half-finished read when the timeout fires. If a 16-byte packet is split across segments at
-  that instant, the stream desynchronises (seq and timestamp misaligned) for the rest of the
-  session. This predates the RTT bug above (the old `read_exact` had the same property).
-  Fix together with it: read into a per-session buffer that survives the timeout.
+- **Echo reads are not cancellation-safe.** `timeout_at(.., recv_heartbeat)` in the client
+  drops a half-finished read when the deadline fires. If a 16-byte packet is split across
+  segments at that instant, the stream desynchronises (seq and timestamp misaligned) for the
+  rest of the session. This is pre-existing (the original `read_exact` had the same
+  property). Fix: read into a per-session buffer that survives the timeout.

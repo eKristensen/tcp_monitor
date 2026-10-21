@@ -389,6 +389,47 @@ mod client_sessions {
     }
 
     #[tokio::test]
+    async fn keeps_measuring_rtt_after_one_late_echo() {
+        // A peer that answers the first heartbeat after the client's 1 s echo
+        // timeout, then answers every later one at once. The late echo sits
+        // in the client's receive buffer when the next round starts.
+        let slow_once = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = slow_once.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut stream, _) = slow_once.accept().await.unwrap();
+            protocol::recv_handshake(&mut stream, 5).await.unwrap();
+            let mut first = true;
+            while let Ok(hb) = protocol::recv_heartbeat(&mut stream).await {
+                if first {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    first = false;
+                }
+                let echo = protocol::encode_packet(hb.seq, hb.timestamp);
+                if stream.write_all(&echo).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let client = start_client("cli", vec![peer("slow", addr)]);
+
+        // The first echo really was late...
+        wait_for_metric(
+            &client.metrics,
+            r#"tcp_monitor_client_heartbeats_missed_total{node="cli",peer="slow"}"#,
+            |v| v >= 1.0,
+        )
+        .await;
+        // ...and RTT is still measured on the prompt echoes after it.
+        wait_for_metric(
+            &client.metrics,
+            r#"tcp_monitor_client_heartbeat_rtt_seconds{node="cli",peer="slow"}"#,
+            |v| v > 0.0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn records_connect_failed_when_nothing_listens() {
         let addr = closed_port().await;
 
