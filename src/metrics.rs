@@ -6,6 +6,7 @@ use prometheus_client::{
     registry::Registry,
 };
 use std::collections::HashSet;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// Hard cap on distinct inbound peer names that may allocate metric label entries.
@@ -25,46 +26,101 @@ pub const CLIENT_DISCONNECT_REASONS: [&str; 5] = [
     "connect_failed",
 ];
 
+/// Labels on per-session metrics.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PeerLabel {
+    /// This node's name (`node.name`).
     pub node: String,
+    /// The other end of the session.
     pub peer: String,
 }
 
+/// Labels on disconnect counters.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct DisconnectLabel {
+    /// This node's name (`node.name`).
     pub node: String,
+    /// The other end of the session.
     pub peer: String,
+    /// One of [`SERVER_DISCONNECT_REASONS`] or [`CLIENT_DISCONNECT_REASONS`].
     pub reason: String,
 }
 
+/// Gauge holding an `f64` (timestamps, durations, RTT).
+pub type FloatGauge = Gauge<f64, AtomicU64>;
+
+/// Every metric family, and the registry they are exposed from.
+/// Each field's doc names the metric it exports (counters get `_total`).
 #[derive(Debug)]
 pub struct Metrics {
-    // --- server side ---
+    /// `tcp_monitor_server_session_active`
     pub server_session_active: Family<PeerLabel, Gauge>,
-    pub server_session_start: Family<PeerLabel, Gauge<f64, std::sync::atomic::AtomicU64>>,
-    pub server_session_duration: Family<PeerLabel, Gauge<f64, std::sync::atomic::AtomicU64>>,
+    /// `tcp_monitor_server_session_start_timestamp_seconds`
+    pub server_session_start: Family<PeerLabel, FloatGauge>,
+    /// `tcp_monitor_server_session_duration_seconds`
+    pub server_session_duration: Family<PeerLabel, FloatGauge>,
+    /// `tcp_monitor_server_sessions_total`
     pub server_sessions_total: Family<PeerLabel, Counter>,
+    /// `tcp_monitor_server_heartbeats_received_total`
     pub server_heartbeats_rx: Family<PeerLabel, Counter>,
-    pub server_last_heartbeat: Family<PeerLabel, Gauge<f64, std::sync::atomic::AtomicU64>>,
+    /// `tcp_monitor_server_last_heartbeat_timestamp_seconds`
+    pub server_last_heartbeat: Family<PeerLabel, FloatGauge>,
+    /// `tcp_monitor_server_session_disconnects_total`
     pub server_disconnects: Family<DisconnectLabel, Counter>,
 
-    // --- client side ---
+    /// `tcp_monitor_client_session_active`
     pub client_session_active: Family<PeerLabel, Gauge>,
-    pub client_session_start: Family<PeerLabel, Gauge<f64, std::sync::atomic::AtomicU64>>,
-    pub client_session_duration: Family<PeerLabel, Gauge<f64, std::sync::atomic::AtomicU64>>,
+    /// `tcp_monitor_client_session_start_timestamp_seconds`
+    pub client_session_start: Family<PeerLabel, FloatGauge>,
+    /// `tcp_monitor_client_session_duration_seconds`
+    pub client_session_duration: Family<PeerLabel, FloatGauge>,
+    /// `tcp_monitor_client_sessions_total`
     pub client_sessions_total: Family<PeerLabel, Counter>,
+    /// `tcp_monitor_client_heartbeats_sent_total`
     pub client_heartbeats_sent: Family<PeerLabel, Counter>,
+    /// `tcp_monitor_client_heartbeats_received_total`
     pub client_heartbeats_rx: Family<PeerLabel, Counter>,
+    /// `tcp_monitor_client_heartbeats_missed_total`
     pub client_heartbeats_missed: Family<PeerLabel, Counter>,
+    /// `tcp_monitor_client_heartbeats_consecutive_missed`
     pub client_consecutive_missed: Family<PeerLabel, Gauge>,
-    pub client_rtt: Family<PeerLabel, Gauge<f64, std::sync::atomic::AtomicU64>>,
-    pub client_last_heartbeat: Family<PeerLabel, Gauge<f64, std::sync::atomic::AtomicU64>>,
+    /// `tcp_monitor_client_heartbeat_rtt_seconds`
+    pub client_rtt: Family<PeerLabel, FloatGauge>,
+    /// `tcp_monitor_client_last_heartbeat_timestamp_seconds`
+    pub client_last_heartbeat: Family<PeerLabel, FloatGauge>,
+    /// `tcp_monitor_client_session_disconnects_total`
     pub client_disconnects: Family<DisconnectLabel, Counter>,
 
+    /// Registry every family above is registered in; encoded by `/metrics`.
     pub registry: Registry,
 
-    seen_server_peers: Mutex<HashSet<String>>,
+    /// Inbound peer names that have allocated label entries.
+    pub server_peers: ServerPeers,
+}
+
+/// The set of inbound peer names that have metric label entries, capped at
+/// [`MAX_UNIQUE_SERVER_PEERS`] because prometheus-client cannot remove them.
+#[derive(Debug, Default)]
+pub struct ServerPeers {
+    /// Names seen so far.
+    seen: Mutex<HashSet<String>>,
+}
+
+impl ServerPeers {
+    /// Returns true if the peer may proceed (either already known or within the cap).
+    /// Returns false when the cap is reached; the caller should reject the connection.
+    pub fn try_register(&self, peer: &str) -> bool {
+        // The set is always left consistent, so a panic elsewhere while holding
+        // the lock does not invalidate it.
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.contains(peer) {
+            return true;
+        }
+        if seen.len() >= MAX_UNIQUE_SERVER_PEERS {
+            return false;
+        }
+        seen.insert(peer.to_owned())
+    }
 }
 
 impl Metrics {
@@ -158,27 +214,8 @@ impl Metrics {
             ),
 
             registry,
-            seen_server_peers: Mutex::new(HashSet::new()),
+            server_peers: ServerPeers::default(),
         })
-    }
-
-    /// Returns true if the peer may proceed (either already known or within the cap).
-    /// Returns false when the cap is reached; the caller should reject the connection.
-    pub fn try_register_server_peer(&self, peer: &str) -> bool {
-        // The set is always left consistent, so a panic elsewhere while holding
-        // the lock does not invalidate it.
-        let mut seen = self
-            .seen_server_peers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if seen.contains(peer) {
-            return true;
-        }
-        if seen.len() >= MAX_UNIQUE_SERVER_PEERS {
-            return false;
-        }
-        seen.insert(peer.to_string());
-        true
     }
 
     /// Render all metrics in the Prometheus text exposition format.
@@ -196,19 +233,19 @@ impl Metrics {
     pub fn init_disconnect_labels(&self, node: &str, peer: &str) {
         for reason in SERVER_DISCONNECT_REASONS {
             let label = DisconnectLabel {
-                node: node.to_string(),
-                peer: peer.to_string(),
-                reason: reason.to_string(),
+                node: node.to_owned(),
+                peer: peer.to_owned(),
+                reason: reason.to_owned(),
             };
-            let _ = self.server_disconnects.get_or_create(&label);
+            drop(self.server_disconnects.get_or_create(&label));
         }
         for reason in CLIENT_DISCONNECT_REASONS {
             let label = DisconnectLabel {
-                node: node.to_string(),
-                peer: peer.to_string(),
-                reason: reason.to_string(),
+                node: node.to_owned(),
+                peer: peer.to_owned(),
+                reason: reason.to_owned(),
             };
-            let _ = self.client_disconnects.get_or_create(&label);
+            drop(self.client_disconnects.get_or_create(&label));
         }
     }
 }
@@ -217,7 +254,7 @@ impl Metrics {
 mod tests {
     use super::*;
 
-    mod try_register_server_peer {
+    mod server_peers_try_register {
         use super::*;
 
         #[test]
@@ -225,7 +262,7 @@ mod tests {
             let metrics = Metrics::new();
 
             let accepted = (0..MAX_UNIQUE_SERVER_PEERS)
-                .all(|i| metrics.try_register_server_peer(&format!("p{i}")));
+                .all(|i| metrics.server_peers.try_register(&format!("p{i}")));
 
             assert!(accepted);
         }
@@ -234,20 +271,20 @@ mod tests {
         fn rejects_a_new_peer_once_the_cap_is_reached() {
             let metrics = Metrics::new();
             for i in 0..MAX_UNIQUE_SERVER_PEERS {
-                metrics.try_register_server_peer(&format!("p{i}"));
+                metrics.server_peers.try_register(&format!("p{i}"));
             }
 
-            assert!(!metrics.try_register_server_peer("one-too-many"));
+            assert!(!metrics.server_peers.try_register("one-too-many"));
         }
 
         #[test]
         fn still_accepts_a_known_peer_once_the_cap_is_reached() {
             let metrics = Metrics::new();
             for i in 0..MAX_UNIQUE_SERVER_PEERS {
-                metrics.try_register_server_peer(&format!("p{i}"));
+                metrics.server_peers.try_register(&format!("p{i}"));
             }
 
-            assert!(metrics.try_register_server_peer("p0"));
+            assert!(metrics.server_peers.try_register("p0"));
         }
     }
 
@@ -292,26 +329,26 @@ mod tests {
         fn exposes_documented_metric_names() {
             let metrics = Metrics::new();
             let label = PeerLabel {
-                node: "me".to_string(),
-                peer: "them".to_string(),
+                node: "me".to_owned(),
+                peer: "them".to_owned(),
             };
             metrics.init_disconnect_labels("me", "them");
-            let _ = metrics.server_session_active.get_or_create(&label);
-            let _ = metrics.server_session_start.get_or_create(&label);
-            let _ = metrics.server_session_duration.get_or_create(&label);
-            let _ = metrics.server_sessions_total.get_or_create(&label);
-            let _ = metrics.server_heartbeats_rx.get_or_create(&label);
-            let _ = metrics.server_last_heartbeat.get_or_create(&label);
-            let _ = metrics.client_session_active.get_or_create(&label);
-            let _ = metrics.client_session_start.get_or_create(&label);
-            let _ = metrics.client_session_duration.get_or_create(&label);
-            let _ = metrics.client_sessions_total.get_or_create(&label);
-            let _ = metrics.client_heartbeats_sent.get_or_create(&label);
-            let _ = metrics.client_heartbeats_rx.get_or_create(&label);
-            let _ = metrics.client_heartbeats_missed.get_or_create(&label);
-            let _ = metrics.client_consecutive_missed.get_or_create(&label);
-            let _ = metrics.client_rtt.get_or_create(&label);
-            let _ = metrics.client_last_heartbeat.get_or_create(&label);
+            drop(metrics.server_session_active.get_or_create(&label));
+            drop(metrics.server_session_start.get_or_create(&label));
+            drop(metrics.server_session_duration.get_or_create(&label));
+            drop(metrics.server_sessions_total.get_or_create(&label));
+            drop(metrics.server_heartbeats_rx.get_or_create(&label));
+            drop(metrics.server_last_heartbeat.get_or_create(&label));
+            drop(metrics.client_session_active.get_or_create(&label));
+            drop(metrics.client_session_start.get_or_create(&label));
+            drop(metrics.client_session_duration.get_or_create(&label));
+            drop(metrics.client_sessions_total.get_or_create(&label));
+            drop(metrics.client_heartbeats_sent.get_or_create(&label));
+            drop(metrics.client_heartbeats_rx.get_or_create(&label));
+            drop(metrics.client_heartbeats_missed.get_or_create(&label));
+            drop(metrics.client_consecutive_missed.get_or_create(&label));
+            drop(metrics.client_rtt.get_or_create(&label));
+            drop(metrics.client_last_heartbeat.get_or_create(&label));
 
             let text = metrics.encode().unwrap();
 

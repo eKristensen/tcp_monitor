@@ -33,7 +33,9 @@ const PROBE_BANNER: &[u8] = b"TCP-MONITOR OK\r\n";
 /// conflict, and so tests can bind port 0 and read back the chosen port.
 #[derive(Debug)]
 pub struct Listeners {
+    /// Listener on `server.heartbeat_port`.
     pub heartbeat: TcpListener,
+    /// Listener on `server.probe_port`.
     pub probe: TcpListener,
 }
 
@@ -49,6 +51,7 @@ impl Listeners {
     }
 }
 
+/// Bind one listener; the error names the config field (`what`) and address.
 async fn bind_one(host: &str, port: u16, what: &str) -> io::Result<TcpListener> {
     let addr = crate::config::bind_addr(host, port)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -57,14 +60,20 @@ async fn bind_one(host: &str, port: u16, what: &str) -> io::Result<TcpListener> 
         .map_err(|e| io::Error::new(e.kind(), format!("bind {what} {addr}: {e}")))
 }
 
+/// Everything [`run`] needs.
 #[derive(Debug)]
 pub struct ServerArgs {
+    /// Already-bound heartbeat and probe listeners.
     pub listeners: Listeners,
     /// Server config at startup; reloads are compared against it.
     pub config: ServerConfig,
+    /// This node's name, the `node` label on server metrics.
     pub node_name: String,
+    /// Shared metrics.
     pub metrics: Arc<Metrics>,
+    /// Stops the accept loops and the config watcher.
     pub cancel: CancellationToken,
+    /// Reloaded configs (SIGHUP); timeouts are applied to new connections.
     pub config_rx: watch::Receiver<Config>,
 }
 
@@ -164,6 +173,8 @@ async fn watch_config(
     }
 }
 
+/// Accept heartbeat connections and spawn a session task for each, up to
+/// [`MAX_CONNECTIONS`], until cancelled.
 async fn heartbeat_accept_loop(
     listener: TcpListener,
     heartbeat_recv_timeout: Arc<AtomicU64>,
@@ -209,6 +220,8 @@ async fn heartbeat_accept_loop(
     }
 }
 
+/// Run one inbound session: handshake, then echo heartbeats until it ends,
+/// recording session metrics and the disconnect reason.
 async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -221,7 +234,7 @@ async fn handle_connection(
         return;
     };
 
-    if !metrics.try_register_server_peer(&peer_name) {
+    if !metrics.server_peers.try_register(&peer_name) {
         warn!(
             "Server peer limit reached ({}), rejecting peer={} addr={}",
             crate::metrics::MAX_UNIQUE_SERVER_PEERS,
@@ -267,7 +280,7 @@ async fn handle_connection(
         .get_or_create(&DisconnectLabel {
             node: node_name,
             peer: peer_name.clone(),
-            reason: reason.to_string(),
+            reason: reason.to_owned(),
         })
         .inc();
 
@@ -277,6 +290,7 @@ async fn handle_connection(
     );
 }
 
+/// Echo heartbeats until the session ends; returns the disconnect reason.
 async fn drive_session(
     stream: &mut TcpStream,
     heartbeat_recv_timeout: u64,
@@ -312,6 +326,10 @@ async fn drive_session(
 
                 let packet = protocol::encode_packet(hb.seq, hb.timestamp);
                 if let Err(e) = stream.write_all(&packet).await {
+                    #[expect(
+                        clippy::wildcard_enum_match_arm,
+                        reason = "io::ErrorKind is non-exhaustive with ~40 variants; every kind not listed is deliberately local_error"
+                    )]
                     match e.kind() {
                         io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset => {
                             return "connection_reset"
@@ -349,10 +367,13 @@ async fn probe_accept_loop(
                 let idle_secs = probe_idle_timeout.load(Ordering::Relaxed);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = stream.write_all(PROBE_BANNER).await;
+                    if let Err(e) = stream.write_all(PROBE_BANNER).await {
+                        debug!("Probe banner write to {} failed: {}", addr, e);
+                        return;
+                    }
                     // Drain until the client closes; timeout prevents permit exhaustion
                     // from clients that never close.
-                    let mut buf = [0u8; 64];
+                    let mut buf = [0_u8; 64];
                     let drain = async {
                         loop {
                             match stream.read(&mut buf).await {
@@ -361,8 +382,17 @@ async fn probe_accept_loop(
                             }
                         }
                     };
-                    let _ = tokio::time::timeout(Duration::from_secs(idle_secs), drain).await;
-                    debug!("Probe connection closed: {}", addr);
+                    if tokio::time::timeout(Duration::from_secs(idle_secs), drain)
+                        .await
+                        .is_err()
+                    {
+                        debug!(
+                            "Probe connection idle for {}s, dropping: {}",
+                            idle_secs, addr
+                        );
+                    } else {
+                        debug!("Probe connection closed: {}", addr);
+                    }
                 });
             }
             Err(e) => {

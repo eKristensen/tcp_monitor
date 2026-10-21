@@ -2,13 +2,9 @@
 //! the metrics they produce. Every listener binds port 0, so tests never
 //! collide with each other or with a running tcp-monitor.
 
-// clippy.toml exempts `#[test]` functions; the shared helpers below need the
-// same exemption, since a failed unwrap there is equally a failed test.
-#![expect(
-    clippy::unwrap_used,
-    clippy::panic,
-    reason = "test helpers: panicking is how a test fails"
-)]
+// This crate only exists under `cargo test`. Saying so lets clippy treat the
+// shared helpers as test code too (clippy.toml's test exemptions).
+#![cfg(test)]
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -28,7 +24,7 @@ const WAIT: Duration = Duration::from_secs(10);
 
 fn server_config(heartbeat_recv_timeout: u64) -> ServerConfig {
     ServerConfig {
-        bind: "127.0.0.1".to_string(),
+        bind: "127.0.0.1".to_owned(),
         heartbeat_port: 0,
         metrics_port: 0,
         probe_port: 0,
@@ -40,7 +36,7 @@ fn server_config(heartbeat_recv_timeout: u64) -> ServerConfig {
 fn node_config(name: &str, server: ServerConfig, peers: Vec<PeerConfig>) -> Config {
     Config {
         node: NodeConfig {
-            name: name.to_string(),
+            name: name.to_owned(),
         },
         server,
         client: Some(ClientConfig {
@@ -54,7 +50,7 @@ fn node_config(name: &str, server: ServerConfig, peers: Vec<PeerConfig>) -> Conf
 
 fn peer(name: &str, addr: SocketAddr) -> PeerConfig {
     PeerConfig {
-        name: name.to_string(),
+        name: name.to_owned(),
         host: addr.ip().to_string(),
         heartbeat_port: addr.port(),
     }
@@ -81,7 +77,7 @@ async fn start_server(name: &str, heartbeat_recv_timeout: u64) -> TestServer {
     let handle = tokio::spawn(server::run(server::ServerArgs {
         listeners,
         config: srv_cfg,
-        node_name: name.to_string(),
+        node_name: name.to_owned(),
         metrics: Arc::clone(&metrics),
         cancel: cancel.clone(),
         config_rx,
@@ -137,7 +133,11 @@ fn sample(text: &str, selector: &str) -> Option<f64> {
 }
 
 /// Poll `metric` until `predicate` holds, failing the test after [`WAIT`].
-async fn wait_for_metric(metrics: &Metrics, selector: &str, predicate: impl Fn(f64) -> bool) {
+async fn wait_for_metric(
+    metrics: &Metrics,
+    selector: &str,
+    predicate: impl Fn(f64) -> bool + Send + Sync,
+) {
     let result = tokio::time::timeout(WAIT, async {
         loop {
             if metric(metrics, selector).is_some_and(&predicate) {
@@ -181,7 +181,7 @@ mod server_sessions {
         let server = start_server("srv", 10).await;
         let mut stream = connect_as(&server, "cli").await;
 
-        let sent = protocol::encode_packet(7, 1234.5);
+        let sent = protocol::encode_packet(7, 1234.5_f64);
         stream.write_all(&sent).await.unwrap();
         let echo = within("echo", protocol::recv_heartbeat(&mut stream))
             .await
@@ -200,13 +200,13 @@ mod server_sessions {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_heartbeats_received_total{node="srv",peer="cli"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
     }
@@ -223,13 +223,13 @@ mod server_sessions {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_disconnects_total{node="srv",peer="cli",reason="remote_close"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
-            |v| v == 0.0,
+            |v| v == 0.0_f64,
         )
         .await;
     }
@@ -242,7 +242,7 @@ mod server_sessions {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_disconnects_total{node="srv",peer="cli",reason="timeout"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
     }
@@ -252,8 +252,8 @@ mod server_sessions {
         let server = start_server("srv", 10).await;
         let mut stream = TcpStream::connect(server.heartbeat_addr).await.unwrap();
 
-        stream.write_all(&0u32.to_be_bytes()).await.unwrap();
-        let mut buf = [0u8; 1];
+        stream.write_all(&0_u32.to_be_bytes()).await.unwrap();
+        let mut buf = [0_u8; 1];
         let read = within("server close", stream.read(&mut buf)).await;
 
         assert!(matches!(read, Ok(0) | Err(_)), "connection left open");
@@ -271,6 +271,10 @@ mod server_sessions {
         // sessions until one times out. Only a session opened after the reload
         // can: the others got the 600 s timeout and are held open meanwhile.
         within("a session to pick up the reloaded timeout", async {
+            #[expect(
+                clippy::collection_is_never_read,
+                reason = "holds each session open so it times out instead of closing"
+            )]
             let mut sessions = Vec::new();
             loop {
                 sessions.push(connect_as(&server, "cli").await);
@@ -279,7 +283,7 @@ mod server_sessions {
                     &server.metrics,
                     r#"tcp_monitor_server_session_disconnects_total{node="srv",peer="cli",reason="timeout"}"#,
                 );
-                if timeouts.is_some_and(|v| v >= 1.0) {
+                if timeouts.is_some_and(|v| v >= 1.0_f64) {
                     return;
                 }
             }
@@ -308,7 +312,7 @@ mod probe_port {
 
         // Literal on purpose: blackbox.example.yml matches this exact banner.
         let expected = b"TCP-MONITOR OK\r\n";
-        let mut banner = vec![0u8; expected.len()];
+        let mut banner = vec![0_u8; expected.len()];
         within("banner", stream.read_exact(&mut banner))
             .await
             .unwrap();
@@ -344,19 +348,19 @@ mod client_sessions {
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_heartbeats_received_total{node="cli",peer="srv"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_heartbeat_rtt_seconds{node="cli",peer="srv"}"#,
-            |v| v > 0.0,
+            |v| v > 0.0_f64,
         )
         .await;
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_heartbeats_received_total{node="srv",peer="cli"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
     }
@@ -370,8 +374,10 @@ mod client_sessions {
         let _held = tokio::spawn(async move {
             let (mut stream, _) = silent.accept().await.unwrap();
             protocol::recv_handshake(&mut stream, 5).await.unwrap();
+            // Read and discard until the client goes away; how it goes away
+            // (FIN, RST, or error) does not matter to this test.
             let mut sink = Vec::new();
-            let _ = stream.read_to_end(&mut sink).await;
+            drop(stream.read_to_end(&mut sink).await);
         });
 
         let client = start_client("cli", vec![peer("mute", addr)]);
@@ -379,7 +385,7 @@ mod client_sessions {
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_session_disconnects_total{node="cli",peer="mute",reason="timeout"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
         assert_eq!(
@@ -387,7 +393,7 @@ mod client_sessions {
                 &client.metrics,
                 r#"tcp_monitor_client_heartbeats_missed_total{node="cli",peer="mute"}"#
             ),
-            Some(3.0)
+            Some(3.0_f64)
         );
     }
 
@@ -420,14 +426,14 @@ mod client_sessions {
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_heartbeats_missed_total{node="cli",peer="slow"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
         // ...and RTT is still measured on the prompt echoes after it.
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_heartbeat_rtt_seconds{node="cli",peer="slow"}"#,
-            |v| v > 0.0,
+            |v| v > 0.0_f64,
         )
         .await;
     }
@@ -476,7 +482,7 @@ mod client_sessions {
                     &text,
                     r#"tcp_monitor_client_heartbeat_rtt_seconds{node="cli",peer="split"}"#,
                 );
-                if rtt.is_some_and(|v| v > 0.0) {
+                if rtt.is_some_and(|v| v > 0.0_f64) {
                     return sample(
                         &text,
                         r#"tcp_monitor_client_heartbeats_sent_total{node="cli",peer="split"}"#,
@@ -487,7 +493,7 @@ mod client_sessions {
         })
         .await;
 
-        assert_eq!(sent_when_rtt_first_measured, Some(2.0));
+        assert_eq!(sent_when_rtt_first_measured, Some(2.0_f64));
     }
 
     #[tokio::test]
@@ -499,7 +505,7 @@ mod client_sessions {
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_session_disconnects_total{node="cli",peer="gone",reason="connect_failed"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
     }
@@ -520,7 +526,7 @@ mod client_reload {
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_session_active{node="cli",peer="srv"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
     }
@@ -532,7 +538,7 @@ mod client_reload {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
 
@@ -546,13 +552,13 @@ mod client_reload {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
-            |v| v == 0.0,
+            |v| v == 0.0_f64,
         )
         .await;
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_session_active{node="cli",peer="srv"}"#,
-            |v| v == 0.0,
+            |v| v == 0.0_f64,
         )
         .await;
     }
@@ -564,7 +570,7 @@ mod client_reload {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
 
@@ -575,7 +581,7 @@ mod client_reload {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
-            |v| v == 0.0,
+            |v| v == 0.0_f64,
         )
         .await;
     }
@@ -587,7 +593,7 @@ mod client_reload {
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_session_active{node="cli",peer="srv"}"#,
-            |v| v >= 1.0,
+            |v| v >= 1.0_f64,
         )
         .await;
 

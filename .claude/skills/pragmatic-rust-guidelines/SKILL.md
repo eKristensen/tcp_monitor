@@ -47,5 +47,8 @@ Repository rules in `CLAUDE.md` win. Known differences:
 
 - **Edition**: M-LATEST-EDITION asks for the latest edition. The crate stays on 2021; see the
   comment in `Cargo.toml`.
+- **Lint levels**: M-STATIC-VERIFICATION sets every lint to `warn`. This repository
+  sets them to `deny` (and some to `forbid`) and enables more of them; see `Cargo.toml` and the
+  lint policy in `CLAUDE.md`. Use the guide's lint list as a floor, not a ceiling.
 - **Errors**: M-APP-ERROR allows `anyhow`. The crate uses `String` and `io::Error` and has no
   `anyhow` dependency. Don't add one without a reason.

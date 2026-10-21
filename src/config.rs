@@ -5,58 +5,86 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 
+/// The whole config file (`/etc/tcp-monitor/config.toml` by default).
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
+    /// `[node]`: identity of this node.
     pub node: NodeConfig,
+    /// `[server]`: inbound heartbeat, probe, and metrics listeners.
     pub server: ServerConfig,
+    /// `[client]`: outbound session timing. Absent means server-only.
     pub client: Option<ClientConfig>,
+    /// `[[peers]]`: nodes this node keeps outbound sessions to.
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
 }
 
+/// `[node]` section.
 #[derive(Deserialize, Clone, Debug)]
 pub struct NodeConfig {
+    /// Unique node name: the `node` label on every metric, and the name sent
+    /// to peers in the handshake.
     pub name: String,
 }
 
+/// `[server]` section. Every field is required (see `CLAUDE.md`).
 #[derive(Deserialize, Clone, Debug)]
 pub struct ServerConfig {
+    /// Literal IP address to bind the heartbeat and probe ports on; IPv6 in
+    /// brackets, e.g. `"[::]"`.
     pub bind: String,
+    /// Port where peer clients connect for heartbeat sessions.
     pub heartbeat_port: u16,
+    /// Port for the Prometheus `/metrics` endpoint.
     pub metrics_port: u16,
+    /// Port for the Blackbox Exporter probe (banner) endpoint.
     pub probe_port: u16,
+    /// Seconds without a heartbeat before a server session is timed out.
     pub heartbeat_recv_timeout: u64,
+    /// Seconds before an idle probe connection is dropped.
     pub probe_idle_timeout: u64,
 }
 
+/// `[client]` section. Fields default when omitted.
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ClientConfig {
+    /// Seconds between heartbeats; also how long to wait for each echo.
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
+    /// Consecutive missed echoes before the session is closed as `timeout`.
     #[serde(default = "default_max_misses")]
     pub max_misses: u32,
+    /// Seconds to wait before reconnecting after a session ends.
     #[serde(default = "default_reconnect_delay")]
     pub reconnect_delay: u64,
 }
 
+/// One `[[peers]]` entry.
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PeerConfig {
+    /// Peer name: the `peer` label on this node's client metrics.
     pub name: String,
+    /// Hostname or IP address to connect to.
     pub host: String,
+    /// The peer's heartbeat port.
     #[serde(default = "default_peer_heartbeat_port")]
     pub heartbeat_port: u16,
 }
 
-fn default_peer_heartbeat_port() -> u16 {
+/// Default for [`PeerConfig::heartbeat_port`].
+const fn default_peer_heartbeat_port() -> u16 {
     9700
 }
-fn default_heartbeat_interval() -> u64 {
+/// Default for [`ClientConfig::heartbeat_interval`], in seconds.
+const fn default_heartbeat_interval() -> u64 {
     30
 }
-fn default_max_misses() -> u32 {
+/// Default for [`ClientConfig::max_misses`].
+const fn default_max_misses() -> u32 {
     3
 }
-fn default_reconnect_delay() -> u64 {
+/// Default for [`ClientConfig::reconnect_delay`], in seconds.
+const fn default_reconnect_delay() -> u64 {
     10
 }
 
@@ -99,9 +127,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
 }
 
 impl Config {
+    /// Check the rules serde cannot express; returns the first violation.
     fn validate(&self) -> Result<(), String> {
         if self.node.name.is_empty() {
-            return Err("node.name must not be empty".to_string());
+            return Err("node.name must not be empty".to_owned());
         }
 
         bind_addr(&self.server.bind, 0)?;
@@ -122,22 +151,22 @@ impl Config {
         }
 
         if self.server.heartbeat_recv_timeout == 0 {
-            return Err("server.heartbeat_recv_timeout must be at least 1".to_string());
+            return Err("server.heartbeat_recv_timeout must be at least 1".to_owned());
         }
 
         if let Some(ref c) = self.client {
             if c.heartbeat_interval == 0 {
-                return Err("client.heartbeat_interval must be at least 1".to_string());
+                return Err("client.heartbeat_interval must be at least 1".to_owned());
             }
             if c.reconnect_delay == 0 {
-                return Err("client.reconnect_delay must be at least 1".to_string());
+                return Err("client.reconnect_delay must be at least 1".to_owned());
             }
         }
 
         let mut seen: HashSet<&str> = HashSet::new();
         for peer in &self.peers {
             if peer.name.is_empty() {
-                return Err("every [[peers]] entry must have a non-empty name".to_string());
+                return Err("every [[peers]] entry must have a non-empty name".to_owned());
             }
             if peer.host.is_empty() {
                 return Err(format!("peer '{}' has an empty host", peer.name));

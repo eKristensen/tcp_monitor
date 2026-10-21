@@ -19,7 +19,9 @@ pub const MAX_PEER_NAME_CHARS: usize = 64;
 /// One heartbeat packet as sent by the client and echoed by the server.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Heartbeat {
+    /// Sequence number, counting up from 0 within a client session.
     pub seq: u64,
+    /// Client wall-clock send time, seconds since the Unix epoch.
     pub timestamp: f64,
 }
 
@@ -27,7 +29,7 @@ pub struct Heartbeat {
 /// Used by both the client sender and the server echo path so the format stays in sync.
 #[must_use]
 pub fn encode_packet(seq: u64, timestamp: f64) -> [u8; PACKET_SIZE] {
-    let mut buf = [0u8; PACKET_SIZE];
+    let mut buf = [0_u8; PACKET_SIZE];
     let fields = seq
         .to_be_bytes()
         .into_iter()
@@ -73,6 +75,7 @@ where
         .map_err(|elapsed| io::Error::new(io::ErrorKind::TimedOut, elapsed))?
 }
 
+/// The handshake read itself, without the timeout.
 async fn read_handshake<R>(stream: &mut R) -> io::Result<String>
 where
     R: AsyncRead + Unpin,
@@ -85,7 +88,7 @@ where
             "invalid handshake length",
         ));
     }
-    let mut name_buf = vec![0u8; len];
+    let mut name_buf = vec![0_u8; len];
     stream.read_exact(&mut name_buf).await?;
     let raw = String::from_utf8(name_buf).unwrap_or_default();
     Ok(sanitize_peer_name(&raw))
@@ -102,7 +105,7 @@ pub fn sanitize_peer_name(name: &str) -> String {
         .take(MAX_PEER_NAME_CHARS)
         .collect();
     if s.is_empty() {
-        "unknown".to_string()
+        "unknown".to_owned()
     } else {
         s
     }
@@ -147,7 +150,9 @@ where
 /// falls out of alignment. Keep one reader per stream for its whole life.
 #[derive(Debug, Default)]
 pub struct HeartbeatReader {
+    /// Bytes of the packet being received.
     buf: [u8; PACKET_SIZE],
+    /// How many bytes of `buf` hold received data.
     filled: usize,
 }
 
@@ -348,7 +353,7 @@ mod tests {
 
         #[tokio::test]
         async fn recv_maps_invalid_utf8_to_unknown() {
-            let mut bytes = 2u32.to_be_bytes().to_vec();
+            let mut bytes = 2_u32.to_be_bytes().to_vec();
             bytes.extend_from_slice(&[0xff, 0xfe]);
 
             assert_eq!(recv_raw(&bytes).await.unwrap(), "unknown");
@@ -356,14 +361,14 @@ mod tests {
 
         #[tokio::test]
         async fn recv_rejects_zero_length() {
-            let err = recv_raw(&0u32.to_be_bytes()).await.unwrap_err();
+            let err = recv_raw(&0_u32.to_be_bytes()).await.unwrap_err();
 
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
 
         #[tokio::test]
         async fn recv_rejects_length_above_256() {
-            let err = recv_raw(&257u32.to_be_bytes()).await.unwrap_err();
+            let err = recv_raw(&257_u32.to_be_bytes()).await.unwrap_err();
 
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }

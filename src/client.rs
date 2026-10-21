@@ -9,8 +9,33 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+/// A running outbound session task for one peer.
+#[derive(Debug)]
+struct PeerTask {
+    /// Peer config the task was started with; a change restarts the task.
+    peer: PeerConfig,
+    /// Stops this task only.
+    cancel: CancellationToken,
+    /// Completes when the task has stopped.
+    handle: JoinHandle<()>,
+}
+
+impl PeerTask {
+    /// Cancel the task and wait for it to finish, logging if it panicked.
+    async fn stop(self) {
+        self.cancel.cancel();
+        if let Err(e) = self.handle.await {
+            error!(
+                "Peer session task for {} ended abnormally: {}",
+                self.peer.name, e
+            );
+        }
+    }
+}
 
 /// Maintain outbound sessions to every configured peer until `cancel` fires
 /// or the config sender is dropped. Peers added, removed, or changed in a
@@ -20,9 +45,7 @@ pub async fn run_manager(
     mut config_rx: watch::Receiver<Config>,
     cancel: CancellationToken,
 ) {
-    // peer_name -> (peer config used at spawn time, cancel token, task handle)
-    let mut tasks: HashMap<String, (PeerConfig, CancellationToken, tokio::task::JoinHandle<()>)> =
-        HashMap::new();
+    let mut tasks: HashMap<String, PeerTask> = HashMap::new();
     let mut last_client_cfg: Option<ClientConfig> = None;
 
     loop {
@@ -31,10 +54,9 @@ pub async fn run_manager(
         let Some(client_cfg) = config.client.clone() else {
             // No client config; cancel any existing tasks and wait for next change.
             let drained: Vec<_> = tasks.drain().collect();
-            for (name, (_, token, handle)) in drained {
+            for (name, task) in drained {
                 info!("Removing peer session (no [client] config): {}", name);
-                token.cancel();
-                let _ = handle.await;
+                task.stop().await;
             }
             last_client_cfg = None;
             tokio::select! {
@@ -78,14 +100,13 @@ pub async fn run_manager(
         // Cancel tasks for peers removed from config or whose address changed.
         let to_remove: Vec<String> = tasks
             .iter()
-            .filter(|(name, (old_peer, _, _))| new_peers.get(*name) != Some(old_peer))
+            .filter(|(name, task)| new_peers.get(*name) != Some(&task.peer))
             .map(|(name, _)| name.clone())
             .collect();
         for name in to_remove {
-            if let Some((_, token, handle)) = tasks.remove(&name) {
+            if let Some(task) = tasks.remove(&name) {
                 info!("Removing peer session: {}", name);
-                token.cancel();
-                let _ = handle.await;
+                task.stop().await;
             }
         }
 
@@ -100,7 +121,14 @@ pub async fn run_manager(
                     Arc::clone(&metrics),
                     token.clone(),
                 ));
-                tasks.insert(name.clone(), (peer.clone(), token, handle));
+                tasks.insert(
+                    name.clone(),
+                    PeerTask {
+                        peer: peer.clone(),
+                        cancel: token,
+                        handle,
+                    },
+                );
                 info!("Started peer session: {}", name);
             }
         }
@@ -112,12 +140,13 @@ pub async fn run_manager(
     }
 
     // Shutdown: cancel all running tasks.
-    for (_, (_, token, handle)) in tasks {
-        token.cancel();
-        let _ = handle.await;
+    for task in tasks.into_values() {
+        task.stop().await;
     }
 }
 
+/// Connect to one peer and run sessions with it, reconnecting after each
+/// one ends, until cancelled.
 async fn run_peer_loop(
     peer: PeerConfig,
     client_cfg: ClientConfig,
@@ -141,7 +170,7 @@ async fn run_peer_loop(
                 let label = DisconnectLabel {
                     node: node_name.clone(),
                     peer: peer.name.clone(),
-                    reason: "connect_failed".to_string(),
+                    reason: "connect_failed".to_owned(),
                 };
                 metrics.client_disconnects.get_or_create(&label).inc();
                 let sleep = tokio::time::sleep(Duration::from_secs(client_cfg.reconnect_delay));
@@ -188,7 +217,7 @@ async fn run_session(
     }
 
     let label = PeerLabel {
-        node: node_name.to_string(),
+        node: node_name.to_owned(),
         peer: peer.name.clone(),
     };
     let start_ts = now_f64();
@@ -288,9 +317,9 @@ async fn run_session(
         metrics
             .client_disconnects
             .get_or_create(&DisconnectLabel {
-                node: node_name.to_string(),
+                node: node_name.to_owned(),
                 peer: peer.name.clone(),
-                reason: reason.to_string(),
+                reason: reason.to_owned(),
             })
             .inc();
         info!(
@@ -302,6 +331,7 @@ async fn run_session(
     reason
 }
 
+/// Record the start of a session in the client metrics.
 fn record_session_start(metrics: &Metrics, label: &PeerLabel, start_ts: f64) {
     metrics.client_session_active.get_or_create(label).set(1);
     metrics
@@ -341,6 +371,10 @@ fn record_echo(metrics: &Metrics, label: &PeerLabel, start_ts: f64, send_ts: Opt
 }
 
 /// Map an I/O error to the disconnect reason reported in metrics.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "io::ErrorKind is non-exhaustive with ~40 variants; every kind not listed is deliberately local_error"
+)]
 fn classify_io_error(e: &std::io::Error) -> &'static str {
     match e.kind() {
         std::io::ErrorKind::ConnectionReset => "connection_reset",

@@ -1,6 +1,11 @@
+//! The `tcp-monitor` binary: parses arguments, loads the config, binds every
+//! port, then runs the server, client manager, metrics endpoint, and signal
+//! handling until SIGTERM or Ctrl-C.
+
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use tcp_monitor::{client, config, metrics, server};
 use tokio::signal::unix::{signal, SignalKind};
@@ -8,8 +13,20 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+/// Config file used when `--config` is not given.
+const DEFAULT_CONFIG_PATH: &str = "/etc/tcp-monitor/config.toml";
+
+/// What the command line asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    /// Run with the config file at this path.
+    Run(PathBuf),
+    /// Print usage and exit.
+    Help,
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("LOG_LEVEL")
@@ -17,13 +34,23 @@ async fn main() {
         )
         .init();
 
-    let config_path = parse_config_path();
+    let config_path = match parse_args(std::env::args().skip(1)) {
+        Ok(Command::Run(path)) => path,
+        Ok(Command::Help) => {
+            print_help();
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            error!("{} (see --help)", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
     let initial_config = match config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to load config: {}", e);
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
     };
 
@@ -35,7 +62,7 @@ async fn main() {
         Ok(l) => l,
         Err(e) => {
             error!("Failed to start server: {}", e);
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
     };
     let metrics_addr = SocketAddr::from(([0, 0, 0, 0], initial_config.server.metrics_port));
@@ -43,7 +70,7 @@ async fn main() {
         Ok(l) => l,
         Err(e) => {
             error!("Failed to bind metrics_port {}: {}", metrics_addr, e);
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
     };
 
@@ -66,7 +93,10 @@ async fn main() {
             match config::load(&config_path) {
                 Ok(new_cfg) => {
                     info!("Config reloaded (SIGHUP): node={}", new_cfg.node.name);
-                    let _ = watcher_tx.send(new_cfg);
+                    if watcher_tx.send(new_cfg).is_err() {
+                        // Every receiver is gone: the process is shutting down.
+                        return;
+                    }
                 }
                 Err(e) => warn!("Config reload failed, keeping current config: {}", e),
             }
@@ -110,36 +140,42 @@ async fn main() {
     cancel_token.cancel();
     drop(config_tx);
 
-    let _ = tokio::join!(server_handle, client_handle);
-}
-
-#[expect(
-    clippy::print_stdout,
-    reason = "--help output belongs on stdout, before logging matters"
-)]
-fn parse_config_path() -> PathBuf {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        None => PathBuf::from("/etc/tcp-monitor/config.toml"),
-        Some("--config") => {
-            if let Some(p) = args.next() {
-                PathBuf::from(p)
-            } else {
-                eprintln!("error: --config requires a path argument");
-                std::process::exit(1);
-            }
-        }
-        Some("--help" | "-h") => {
-            println!("Usage: tcp-monitor [--config <path>]");
-            println!("  Default config path: /etc/tcp-monitor/config.toml");
-            println!("  Log level:           LOG_LEVEL=debug (env var)");
-            std::process::exit(0);
-        }
-        Some(arg) => {
-            eprintln!("error: unknown argument '{arg}'");
-            std::process::exit(1);
+    let (server_result, client_result) = tokio::join!(server_handle, client_handle);
+    let mut exit = ExitCode::SUCCESS;
+    for (task, result) in [("server", server_result), ("client manager", client_result)] {
+        if let Err(e) = result {
+            error!("The {} task ended abnormally: {}", task, e);
+            exit = ExitCode::FAILURE;
         }
     }
+    exit
+}
+
+/// Parse the command-line arguments (without the program name).
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
+    let command = match args.next().as_deref() {
+        None => Command::Run(PathBuf::from(DEFAULT_CONFIG_PATH)),
+        Some("--config") => {
+            let path = args.next().ok_or("--config requires a path argument")?;
+            Command::Run(PathBuf::from(path))
+        }
+        Some("--help" | "-h") => Command::Help,
+        Some(arg) => return Err(format!("unknown argument '{arg}'")),
+    };
+    args.next().map_or(Ok(command), |extra| {
+        Err(format!("unexpected argument '{extra}'"))
+    })
+}
+
+/// Print usage for `--help`.
+#[expect(
+    clippy::print_stdout,
+    reason = "--help output is for the terminal, not the log"
+)]
+fn print_help() {
+    println!("Usage: tcp-monitor [--config <path>]");
+    println!("  Default config path: {DEFAULT_CONFIG_PATH}");
+    println!("  Log level:           LOG_LEVEL=debug (env var)");
 }
 
 /// Resolves on SIGTERM or Ctrl-C, whichever comes first.
@@ -163,6 +199,7 @@ async fn cancel_token_signal() {
     }
 }
 
+/// `GET /metrics`: every metric in the Prometheus text format.
 async fn metrics_handler(State(metrics): State<Arc<metrics::Metrics>>) -> impl IntoResponse {
     let Ok(buf) = metrics.encode() else {
         return (
@@ -180,4 +217,62 @@ async fn metrics_handler(State(metrics): State<Arc<metrics::Metrics>>) -> impl I
         buf,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Command, String> {
+        parse_args(args.iter().map(|a| (*a).to_owned()))
+    }
+
+    mod parse_args {
+        use super::*;
+
+        #[test]
+        fn uses_the_default_config_path_without_arguments() {
+            assert_eq!(
+                parse(&[]),
+                Ok(Command::Run(PathBuf::from("/etc/tcp-monitor/config.toml")))
+            );
+        }
+
+        #[test]
+        fn takes_the_path_after_config() {
+            assert_eq!(
+                parse(&["--config", "/tmp/x.toml"]),
+                Ok(Command::Run(PathBuf::from("/tmp/x.toml")))
+            );
+        }
+
+        #[test]
+        fn rejects_config_without_a_path() {
+            assert!(parse(&["--config"])
+                .unwrap_err()
+                .contains("requires a path"));
+        }
+
+        #[test]
+        fn recognises_both_help_flags() {
+            assert_eq!(
+                (parse(&["-h"]), parse(&["--help"])),
+                (Ok(Command::Help), Ok(Command::Help))
+            );
+        }
+
+        #[test]
+        fn rejects_an_unknown_argument() {
+            assert!(parse(&["--verbose"])
+                .unwrap_err()
+                .contains("unknown argument"));
+        }
+
+        #[test]
+        fn rejects_a_trailing_argument() {
+            assert!(parse(&["--config", "a.toml", "b.toml"])
+                .unwrap_err()
+                .contains("unexpected argument"));
+        }
+    }
 }

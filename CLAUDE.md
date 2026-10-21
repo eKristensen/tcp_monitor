@@ -31,11 +31,25 @@ suite on the MSRV toolchain.
 ## Lint policy
 
 - The lint set lives in `Cargo.toml` `[lints]`, with test exemptions in `clippy.toml`.
-  Don't weaken it globally.
+  It is stricter than both vendored guides, which use `warn` and rely on CI's
+  `-D warnings`:
+  - Every lint is `deny`, so a violation fails `cargo clippy`, and for rustc lints such as
+    `missing_docs` even `cargo build`, locally as well as in CI.
+  - Lints with no legitimate exception (`unsafe_code`, `dbg_macro`, `todo`,
+    `unimplemented`) are `forbid`, which cannot be overridden at all.
+  - Enabled on top of the default clippy groups: `pedantic`, `nursery`, `cargo`, the rustc
+    lint groups (`rust_2018_idioms`, `unused`, `future_incompatible`, `let_underscore`,
+    ...), `missing_docs`, `missing_docs_in_private_items`, and a curated set of restriction
+    lints.
+  - Don't weaken any of it globally, and don't lower `deny` to `warn`.
 - Suppress a lint only at the item that needs it, with
-  `#[expect(clippy::lint, reason = "...")]`. `#[allow]` is itself linted.
-- Production code has no `unwrap`, `expect`, `panic!`, unchecked indexing/slicing, or `as`
-  casts. Use `let ... else`, `get()`, `try_from`, `From`, and so on.
+  `#[expect(clippy::lint, reason = "...")]`. `#[allow]` is itself denied.
+- Production code has no `unwrap`, `expect`, `panic!`, `process::exit`, `println!`/`eprintln!`,
+  unchecked indexing/slicing, or `as` casts. Results are never discarded with `let _ =`:
+  handle them, or `drop(...)` them with a comment saying why the outcome doesn't matter.
+- Every item, private ones included, has a doc comment.
+- Integration test crates start with `#![cfg(test)]` so clippy applies its test
+  exemptions to their helper functions too.
 - CI pins the lint toolchain (`toolchain: "1.97"` in `.github/workflows/ci.yml`), so a new
   clippy release cannot break CI on its own. Bump it deliberately and fix new findings in the
   same change.
