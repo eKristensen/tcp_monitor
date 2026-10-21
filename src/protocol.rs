@@ -124,15 +124,83 @@ where
 
 /// Read one heartbeat packet.
 ///
+/// Not cancellation-safe across calls: if the returned future is dropped
+/// mid-packet (e.g. by a timeout), the bytes already read are lost and the
+/// stream is misaligned. Use a [`HeartbeatReader`] when the read can be
+/// cancelled and the stream is used afterwards.
+///
 /// # Errors
 /// Returns `UnexpectedEof` if the stream closes mid-packet, or any I/O error.
 pub async fn recv_heartbeat<R>(stream: &mut R) -> io::Result<Heartbeat>
 where
     R: AsyncRead + Unpin,
 {
-    let seq = stream.read_u64().await?;
-    let timestamp = f64::from_bits(stream.read_u64().await?);
-    Ok(Heartbeat { seq, timestamp })
+    HeartbeatReader::new().recv(stream).await
+}
+
+/// Reads heartbeat packets from one stream, cancellation-safely.
+///
+/// Partially received bytes live in the reader rather than in the future
+/// returned by [`HeartbeatReader::recv`]. If that future is dropped — for
+/// example by `tokio::time::timeout` while a packet is split across TCP
+/// segments — the next call resumes where it stopped, so the stream never
+/// falls out of alignment. Keep one reader per stream for its whole life.
+#[derive(Debug, Default)]
+pub struct HeartbeatReader {
+    buf: [u8; PACKET_SIZE],
+    filled: usize,
+}
+
+impl HeartbeatReader {
+    /// A reader with no partial packet buffered.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; PACKET_SIZE],
+            filled: 0,
+        }
+    }
+
+    /// Read the next complete heartbeat packet.
+    ///
+    /// Cancellation-safe: dropping the future loses no data, because the
+    /// only await point is `AsyncReadExt::read`, which tokio documents as
+    /// cancel-safe, and progress is stored in `self` after every read.
+    ///
+    /// # Errors
+    /// Returns `UnexpectedEof` if the stream closes, including mid-packet,
+    /// or any I/O error.
+    pub async fn recv<R>(&mut self, stream: &mut R) -> io::Result<Heartbeat>
+    where
+        R: AsyncRead + Unpin,
+    {
+        while self.filled < PACKET_SIZE {
+            let unfilled = self
+                .buf
+                .get_mut(self.filled..)
+                .ok_or_else(|| io::Error::other("heartbeat buffer overrun"))?;
+            let read = stream.read(unfilled).await?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "stream closed mid-heartbeat",
+                ));
+            }
+            self.filled += read;
+        }
+        self.filled = 0;
+        Ok(decode_packet(self.buf))
+    }
+}
+
+/// Inverse of [`encode_packet`]. Destructures the array instead of slicing,
+/// so it cannot panic.
+const fn decode_packet(buf: [u8; PACKET_SIZE]) -> Heartbeat {
+    let [s0, s1, s2, s3, s4, s5, s6, s7, t0, t1, t2, t3, t4, t5, t6, t7] = buf;
+    Heartbeat {
+        seq: u64::from_be_bytes([s0, s1, s2, s3, s4, s5, s6, s7]),
+        timestamp: f64::from_bits(u64::from_be_bytes([t0, t1, t2, t3, t4, t5, t6, t7])),
+    }
 }
 
 #[cfg(test)]
@@ -182,6 +250,57 @@ mod tests {
             drop(tx);
 
             let err = recv_heartbeat(&mut rx).await.unwrap_err();
+
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    mod heartbeat_reader {
+        use super::*;
+
+        #[tokio::test(start_paused = true)]
+        async fn resumes_a_packet_split_across_a_cancelled_read() {
+            let (mut tx, mut rx) = duplex(64);
+            let packet = encode_packet(9, 2.5);
+            let mut reader = HeartbeatReader::new();
+            tx.write_all(&packet[..10]).await.unwrap();
+
+            // The timeout drops the read while 10 of 16 bytes have arrived.
+            tokio::time::timeout(Duration::from_secs(1), reader.recv(&mut rx))
+                .await
+                .unwrap_err();
+            tx.write_all(&packet[10..]).await.unwrap();
+            let resumed = reader.recv(&mut rx).await.unwrap();
+
+            assert_eq!(
+                resumed,
+                Heartbeat {
+                    seq: 9,
+                    timestamp: 2.5
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn reads_back_to_back_packets_in_order() {
+            let (mut tx, mut rx) = duplex(64);
+            let mut both = encode_packet(1, 1.0).to_vec();
+            both.extend_from_slice(&encode_packet(2, 2.0));
+            tx.write_all(&both).await.unwrap();
+            let mut reader = HeartbeatReader::new();
+
+            let first = reader.recv(&mut rx).await.unwrap();
+            let second = reader.recv(&mut rx).await.unwrap();
+
+            assert_eq!((first.seq, second.seq), (1, 2));
+        }
+
+        #[tokio::test]
+        async fn returns_unexpected_eof_when_stream_closes_between_packets() {
+            let (tx, mut rx) = duplex(64);
+            drop(tx);
+
+            let err = HeartbeatReader::new().recv(&mut rx).await.unwrap_err();
 
             assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         }

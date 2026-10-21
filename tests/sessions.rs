@@ -124,10 +124,13 @@ fn start_client(name: &str, peers: Vec<PeerConfig>) -> TestClient {
 /// Value of the sample whose name and labels start with `selector`, e.g.
 /// `tcp_monitor_server_sessions_total{node="srv",peer="cli"`.
 fn metric(metrics: &Metrics, selector: &str) -> Option<f64> {
-    metrics
-        .encode()
-        .unwrap()
-        .lines()
+    sample(&metrics.encode().unwrap(), selector)
+}
+
+/// Like [`metric`], but reads from an already-encoded snapshot, so several
+/// values can be compared as of the same instant.
+fn sample(text: &str, selector: &str) -> Option<f64> {
+    text.lines()
         .find(|line| line.starts_with(selector))
         .and_then(|line| line.rsplit(' ').next())
         .and_then(|value| value.parse().ok())
@@ -427,6 +430,64 @@ mod client_sessions {
             |v| v > 0.0,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn measures_rtt_in_the_round_after_an_echo_split_across_the_timeout() {
+        // A peer that sends the first 10 bytes of the first echo, waits past
+        // the client's 1 s echo timeout, then sends the remaining 6 and
+        // answers every later heartbeat at once. The timeout fires mid-packet.
+        let split_once = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = split_once.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut stream, _) = split_once.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            protocol::recv_handshake(&mut stream, 5).await.unwrap();
+            let mut first = true;
+            while let Ok(hb) = protocol::recv_heartbeat(&mut stream).await {
+                let echo = protocol::encode_packet(hb.seq, hb.timestamp);
+                let (head, tail) = echo.split_at(10);
+                if first {
+                    first = false;
+                    if stream.write_all(head).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    if stream.write_all(tail).await.is_err() {
+                        return;
+                    }
+                } else if stream.write_all(&echo).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let client = start_client("cli", vec![peer("split", addr)]);
+
+        // Round 1 times out mid-packet (1 sent). In round 2 (2 sent) the
+        // client must finish the split echo, see it is stale, then match the
+        // prompt echo and measure RTT. A client that dropped the 10 buffered
+        // bytes would instead read a misaligned, garbage packet in round 2,
+        // and measure RTT only in round 3. Both values come from one snapshot.
+        let sent_when_rtt_first_measured = within("an RTT measurement", async {
+            loop {
+                let text = client.metrics.encode().unwrap();
+                let rtt = sample(
+                    &text,
+                    r#"tcp_monitor_client_heartbeat_rtt_seconds{node="cli",peer="split"}"#,
+                );
+                if rtt.is_some_and(|v| v > 0.0) {
+                    return sample(
+                        &text,
+                        r#"tcp_monitor_client_heartbeats_sent_total{node="cli",peer="split"}"#,
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        assert_eq!(sent_when_rtt_first_measured, Some(2.0));
     }
 
     #[tokio::test]

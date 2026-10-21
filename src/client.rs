@@ -201,6 +201,9 @@ async fn run_session(
     let mut seq: u64 = 0;
     let mut consecutive_missed: i64 = 0;
     let mut next_send = tokio::time::Instant::now();
+    // One reader for the whole session: the echo wait below is cut off by a
+    // deadline, and the reader keeps any partly received packet across that.
+    let mut echoes = protocol::HeartbeatReader::new();
 
     let reason: &'static str = 'session: loop {
         // Wait until next heartbeat time, or cancel.
@@ -234,7 +237,7 @@ async fn run_session(
         let mut got_echo = false;
         loop {
             let echo_result = tokio::select! {
-                r = tokio::time::timeout_at(deadline, protocol::recv_heartbeat(&mut stream)) => r,
+                r = tokio::time::timeout_at(deadline, echoes.recv(&mut stream)) => r,
                 () = cancel.cancelled() => break 'session "cancelled",
             };
             match echo_result {

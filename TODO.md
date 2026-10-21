@@ -101,8 +101,3 @@ it.
   character; the server then labels the peer `unknown`. Truncate on a character boundary.
 - **Metrics bind address**: the metrics endpoint always binds `0.0.0.0`, ignoring
   `server.bind`.
-- **Echo reads are not cancellation-safe.** `timeout_at(.., recv_heartbeat)` in the client
-  drops a half-finished read when the deadline fires. If a 16-byte packet is split across
-  segments at that instant, the stream desynchronises (seq and timestamp misaligned) for the
-  rest of the session. This is pre-existing (the original `read_exact` had the same
-  property). Fix: read into a per-session buffer that survives the timeout.
