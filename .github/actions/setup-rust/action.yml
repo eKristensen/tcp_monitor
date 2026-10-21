@@ -1,0 +1,44 @@
+name: Set up Rust
+description: >
+  Install a Rust toolchain with the rustup preinstalled on GitHub-hosted runners,
+  and cache cargo downloads and build output with the official actions/cache.
+
+inputs:
+  toolchain:
+    description: Toolchain to install and make default, e.g. "stable" or "1.85"
+    required: true
+  components:
+    description: Comma-separated rustup components, e.g. "clippy,rustfmt"
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust ${{ inputs.toolchain }}
+      id: toolchain
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        args=(--profile minimal --no-self-update)
+        if [ -n "$COMPONENTS" ]; then args+=(--component "$COMPONENTS"); fi
+        rustup toolchain install "$TOOLCHAIN" "${args[@]}"
+        rustup default "$TOOLCHAIN"
+        rustc --version
+        # Exact compiler version for the cache key: build output from one
+        # rustc cannot be reused by another, and "stable" moves over time.
+        echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+
+    - name: Cache cargo registry and build output
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ github.job }}-${{ steps.toolchain.outputs.rustc }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ github.job }}-${{ steps.toolchain.outputs.rustc }}-

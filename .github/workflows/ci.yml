@@ -16,13 +16,11 @@ jobs:
 
       # Pinned so a new clippy release cannot break CI on its own. Bump
       # deliberately and fix any new findings in the same change.
-      - name: Install Rust 1.97
-        uses: dtolnay/rust-toolchain@1.97
+      - name: Set up Rust 1.97
+        uses: ./.github/actions/setup-rust
         with:
-          components: clippy, rustfmt
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+          toolchain: "1.97"
+          components: clippy,rustfmt
 
       - name: Format
         run: cargo fmt --check
@@ -36,11 +34,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Set up Rust stable
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
 
       - name: Unit and integration tests
         run: cargo test --locked
@@ -67,11 +64,10 @@ jobs:
       - uses: actions/checkout@v4
 
       # Must match `rust-version` in Cargo.toml.
-      - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Set up Rust 1.85
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain: "1.85"
 
       - name: Tests on MSRV
         run: cargo test --locked

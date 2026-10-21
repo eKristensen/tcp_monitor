@@ -36,9 +36,11 @@ suite on the MSRV toolchain.
   `#[expect(clippy::lint, reason = "...")]`. `#[allow]` is itself linted.
 - Production code has no `unwrap`, `expect`, `panic!`, unchecked indexing/slicing, or `as`
   casts. Use `let ... else`, `get()`, `try_from`, `From`, and so on.
-- CI pins the lint toolchain (`dtolnay/rust-toolchain@1.97` in `.github/workflows/ci.yml`),
-  so a new clippy release cannot break CI on its own. Bump it deliberately and fix new
-  findings in the same change.
+- CI pins the lint toolchain (`toolchain: "1.97"` in `.github/workflows/ci.yml`), so a new
+  clippy release cannot break CI on its own. Bump it deliberately and fix new findings in the
+  same change.
+- CI uses only GitHub's official `actions/*` actions plus the local
+  `.github/actions/setup-rust` (rustup + `actions/cache`). Don't add third-party actions.
 
 ## MSRV
 
