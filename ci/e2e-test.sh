@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end heartbeat test.
 # Starts a server and a client; after a few 2-second heartbeats both sides
-# must show non-zero counters and a non-zero RTT in /metrics.
+# must show non-zero counters and a non-zero RTT in /metrics. The client also
+# runs a session pool with 1-6 s lifetimes, whose sessions must expire, and be
+# recorded as expired on both sides, within the test.
 # Run from the repository root: ci/e2e-test.sh
 set -euo pipefail
 
@@ -33,6 +35,9 @@ probe_idle_timeout     = 10
 heartbeat_interval = 2
 max_misses         = 3
 reconnect_delay    = 2
+[client.pool]
+open_interval = 2
+lifetime      = 4
 [[peers]]
 name = "ci-server"
 host           = "127.0.0.1"
@@ -62,4 +67,13 @@ RTT=$(echo "$CLIENT_M"       | grep 'tcp_monitor_client_heartbeat_rtt_seconds{' 
 [[ -n "$CLIENT_HB" ]] && [[ "${CLIENT_HB%.*}" -ge 2 ]] || { echo "ERROR: client heartbeats=$CLIENT_HB"; echo "$CLIENT_M"; exit 1; }
 [[ -n "$RTT"       ]] && [[ "$RTT" != "0"             ]] || { echo "ERROR: RTT=$RTT"; exit 1; }
 
-echo "E2E test passed (server_hb=$SERVER_HB client_hb=$CLIENT_HB rtt=$RTT)"
+CLIENT_EXPIRED=$(echo "$CLIENT_M" | grep 'tcp_monitor_client_pool_session_ends_total{node="ci-client",peer="ci-server",reason="expired"}' | awk '{print $2}')
+SERVER_EXPIRED=$(echo "$SERVER_M" | grep 'tcp_monitor_server_pool_session_ends_total{node="ci-server",peer="ci-client",reason="expired"}' | awk '{print $2}')
+# Every pool close in this test is planned, so the server must see no other reason.
+SERVER_EARLY=$(echo "$SERVER_M" | grep '^tcp_monitor_server_pool_session_ends_total{' | grep -v 'reason="expired"' | awk '{s += $2} END {print s + 0}')
+
+[[ -n "$CLIENT_EXPIRED" ]] && [[ "${CLIENT_EXPIRED%.*}" -ge 1 ]] || { echo "ERROR: client pool expired=$CLIENT_EXPIRED"; echo "$CLIENT_M"; exit 1; }
+[[ -n "$SERVER_EXPIRED" ]] && [[ "${SERVER_EXPIRED%.*}" -ge 1 ]] || { echo "ERROR: server pool expired=$SERVER_EXPIRED"; echo "$SERVER_M"; exit 1; }
+[[ "$SERVER_EARLY" == "0" ]] || { echo "ERROR: server saw $SERVER_EARLY unplanned pool closes"; echo "$SERVER_M"; exit 1; }
+
+echo "E2E test passed (server_hb=$SERVER_HB client_hb=$CLIENT_HB rtt=$RTT pool_expired=$CLIENT_EXPIRED/$SERVER_EXPIRED)"

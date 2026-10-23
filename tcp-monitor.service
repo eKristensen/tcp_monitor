@@ -10,6 +10,10 @@ ExecStart=/usr/local/bin/tcp-monitor --config /etc/tcp-monitor/config.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
+# One file descriptor per session. Session pools need far more than the usual
+# soft limit of 1024: up to 2048 inbound sessions (MAX_CONNECTIONS in
+# src/server.rs) plus this node's own outbound pools.
+LimitNOFILE=8192
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=tcp-monitor

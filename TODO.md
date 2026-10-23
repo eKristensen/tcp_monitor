@@ -52,8 +52,9 @@ segments.
 - Server-side size cap as a constant. Adding a new `[server]` field would break existing
   configs, because `[server]` fields are required.
 - Metrics: new `tcp_monitor_*_large_*` families, so existing metric names don't change.
-- Requires a backward-compatible handshake v2: a magic `u32` prefix larger than 256, so old
-  servers reject it cleanly and new servers still accept old clients.
+- Uses the version 2 handshake (added for session pools) with a new `SessionKind`, so the
+  server can tell the large-payload connection apart. Old servers reject version 2 cleanly,
+  and new servers still accept version 1 clients.
 
 **Test idea without opening ports.** Use network namespaces in CI: `A ─1500─ R ─1280→ B`, where
 R's end of the R–B link has MTU 1280 and B's end 1500 (so both endpoints advertise MSS 1460),
@@ -101,7 +102,7 @@ it.
   character; the server then labels the peer `unknown`. Truncate on a character boundary.
 - **Metrics bind address**: the metrics endpoint always binds `0.0.0.0`, ignoring
   `server.bind`.
-- **Inbound slot exhaustion (security hardening).** An unauthenticated client can hold all 128
+- **Inbound slot exhaustion (security hardening).** An unauthenticated client can hold all 2048
   heartbeat slots: for 5 s each without a handshake, or for `heartbeat_recv_timeout` after
   any handshake. Real peers are locked out meanwhile. Sending 512 distinct handshake names
   also fills `MAX_UNIQUE_SERVER_PEERS` until restart. The caps bound memory correctly; a

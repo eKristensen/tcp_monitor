@@ -57,6 +57,58 @@ pub struct ClientConfig {
     /// Seconds to wait before reconnecting after a session ends.
     #[serde(default = "default_reconnect_delay")]
     pub reconnect_delay: u64,
+    /// `[client.pool]`: a pool of staggered sessions per peer. Absent means
+    /// only the one primary session per peer.
+    pub pool: Option<PoolConfig>,
+}
+
+/// `[client.pool]` section. Fields default when omitted.
+///
+/// Each peer gets a pool of sessions, opened one at a time every
+/// `open_interval` and closed on purpose when they reach their planned
+/// lifetime. A session that ends earlier was cut off, typically because the
+/// path it was pinned to when it opened has failed.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PoolConfig {
+    /// Seconds between new pool sessions to each peer (randomised by ±10%).
+    #[serde(default = "default_pool_open_interval")]
+    pub open_interval: u64,
+    /// Mean planned lifetime of a pool session, in seconds. Each session
+    /// draws its own from 50% to 150% of this, so closes don't line up.
+    #[serde(default = "default_pool_lifetime")]
+    pub lifetime: u64,
+}
+
+impl PoolConfig {
+    /// Sessions per peer once the pool has filled: `lifetime / open_interval`,
+    /// rounded up. Also how many are opened at once on startup.
+    #[must_use]
+    pub const fn target_size(&self) -> u64 {
+        self.lifetime.div_ceil(self.open_interval)
+    }
+
+    /// Rules for `[client.pool]` beyond the shared timing bounds, which
+    /// [`Config::validate`] has already checked for `open_interval`.
+    fn validate(&self) -> Result<(), String> {
+        if self.lifetime < self.open_interval {
+            return Err(format!(
+                "client.pool.lifetime ({}) must be at least client.pool.open_interval ({})",
+                self.lifetime, self.open_interval
+            ));
+        }
+        if self.lifetime > MAX_POOL_LIFETIME {
+            return Err(format!(
+                "client.pool.lifetime must be at most {MAX_POOL_LIFETIME} (one week)"
+            ));
+        }
+        if self.target_size() > MAX_POOL_SIZE {
+            return Err(format!(
+                "client.pool.lifetime / open_interval gives {} sessions per peer; the maximum is {MAX_POOL_SIZE}",
+                self.target_size()
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One `[[peers]]` entry.
@@ -87,6 +139,27 @@ const fn default_max_misses() -> u32 {
 const fn default_reconnect_delay() -> u64 {
     10
 }
+/// Default for [`PoolConfig::open_interval`]: 15 minutes, so four new
+/// sessions per hour sample where the load balancer sends new sessions.
+const fn default_pool_open_interval() -> u64 {
+    900
+}
+/// Default for [`PoolConfig::lifetime`]: one day, so the pool holds sessions
+/// pinned during the last day. With the default interval that is 96 sessions.
+const fn default_pool_lifetime() -> u64 {
+    86_400
+}
+
+/// Upper bound for [`PoolConfig::lifetime`], in seconds (one week). Sessions
+/// draw up to 150% of it, which still keeps timer arithmetic far from overflow.
+pub const MAX_POOL_LIFETIME: u64 = 7 * 86_400;
+
+/// Upper bound for [`PoolConfig::target_size`].
+///
+/// Each pool session is an inbound connection on the peer, which accepts at
+/// most 2048 in total (`MAX_CONNECTIONS` in `server.rs`), shared by every
+/// client that uses it.
+pub const MAX_POOL_SIZE: u64 = 1000;
 
 /// Upper bound for every timing field, in seconds (one day). Far beyond any
 /// sensible setting, and it keeps timer arithmetic (`Instant + Duration`)
@@ -171,6 +244,9 @@ impl Config {
         if let Some(ref c) = self.client {
             timings.push(("client.heartbeat_interval", c.heartbeat_interval, 1));
             timings.push(("client.reconnect_delay", c.reconnect_delay, 1));
+            if let Some(ref pool) = c.pool {
+                timings.push(("client.pool.open_interval", pool.open_interval, 1));
+            }
         }
         for (field, value, min) in timings {
             if value < min {
@@ -179,6 +255,10 @@ impl Config {
             if value > MAX_SECONDS {
                 return Err(format!("{field} must be at most {MAX_SECONDS} (one day)"));
             }
+        }
+
+        if let Some(pool) = self.client.as_ref().and_then(|c| c.pool.as_ref()) {
+            pool.validate()?;
         }
 
         let mut seen: HashSet<&str> = HashSet::new();
@@ -233,6 +313,24 @@ mod tests {
         }
 
         #[test]
+        fn accepts_the_example_pool_section_once_uncommented() {
+            let example = include_str!("../config.example.toml");
+            let text = ["[client.pool]", "open_interval", "lifetime"]
+                .iter()
+                .fold(example.to_owned(), |text, key| {
+                    text.replace(&format!("#{key}"), key)
+                });
+
+            assert_eq!(
+                parse(&text).unwrap().client.and_then(|c| c.pool),
+                Some(PoolConfig {
+                    open_interval: 900,
+                    lifetime: 86_400,
+                })
+            );
+        }
+
+        #[test]
         fn accepts_server_only_config_without_client_or_peers() {
             let cfg = parse(SERVER_ONLY).unwrap();
 
@@ -249,7 +347,51 @@ mod tests {
                     heartbeat_interval: 30,
                     max_misses: 3,
                     reconnect_delay: 10,
+                    pool: None,
                 })
+            );
+        }
+
+        #[test]
+        fn fills_pool_defaults_for_empty_pool_section() {
+            let cfg = parse(&with("[client.pool]")).unwrap();
+
+            assert_eq!(
+                cfg.client.and_then(|c| c.pool),
+                Some(PoolConfig {
+                    open_interval: 900,
+                    lifetime: 86_400,
+                })
+            );
+        }
+
+        #[test]
+        fn rejects_pool_lifetime_shorter_than_open_interval() {
+            assert!(
+                parse_err(&with("[client.pool]\nopen_interval = 60\nlifetime = 59"))
+                    .contains("client.pool.lifetime (59) must be at least")
+            );
+        }
+
+        #[test]
+        fn rejects_pool_lifetime_above_one_week() {
+            assert!(parse_err(&with(
+                "[client.pool]\nopen_interval = 86400\nlifetime = 604801"
+            ))
+            .contains("client.pool.lifetime must be at most 604800"));
+        }
+
+        #[test]
+        fn rejects_zero_pool_open_interval() {
+            assert!(parse_err(&with("[client.pool]\nopen_interval = 0"))
+                .contains("client.pool.open_interval must be at least 1"));
+        }
+
+        #[test]
+        fn rejects_a_pool_of_more_than_1000_sessions_per_peer() {
+            assert!(
+                parse_err(&with("[client.pool]\nopen_interval = 60\nlifetime = 60060"))
+                    .contains("gives 1001 sessions per peer")
             );
         }
 

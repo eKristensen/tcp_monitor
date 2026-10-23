@@ -1,5 +1,8 @@
-//! Client side: keeps one outbound heartbeat session open per configured peer
-//! and reconciles the set of sessions when the config is reloaded.
+//! Client side: outbound sessions to every configured peer.
+//!
+//! Keeps one primary heartbeat session open per peer, plus a session pool
+//! per peer when `[client.pool]` is set (see `pool.rs`), and reconciles the
+//! set of peers when the config is reloaded.
 
 use crate::config::{ClientConfig, Config, PeerConfig};
 use crate::metrics::{DisconnectLabel, Metrics, PeerLabel};
@@ -10,6 +13,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -87,6 +91,9 @@ pub async fn run_manager(
                         old_cfg.reconnect_delay, client_cfg.reconnect_delay
                     );
                 }
+                if old_cfg.pool != client_cfg.pool {
+                    warn!("client.pool changed; restart required for running pools");
+                }
             }
         }
         last_client_cfg = Some(client_cfg.clone());
@@ -114,7 +121,7 @@ pub async fn run_manager(
         for (name, peer) in &new_peers {
             if !tasks.contains_key(name) {
                 let token = CancellationToken::new();
-                let handle = tokio::spawn(run_peer_loop(
+                let handle = tokio::spawn(run_peer(
                     peer.clone(),
                     client_cfg.clone(),
                     node_name.clone(),
@@ -143,6 +150,33 @@ pub async fn run_manager(
     for task in tasks.into_values() {
         task.stop().await;
     }
+}
+
+/// Run everything this node keeps open to one peer until cancelled: the
+/// primary session, and the session pool if one is configured.
+async fn run_peer(
+    peer: PeerConfig,
+    client_cfg: ClientConfig,
+    node_name: String,
+    metrics: Arc<Metrics>,
+    cancel: CancellationToken,
+) {
+    let Some(pool_cfg) = client_cfg.pool.clone() else {
+        run_peer_loop(peer, client_cfg, node_name, metrics, cancel).await;
+        return;
+    };
+    let pool = crate::pool::run(crate::pool::PoolArgs {
+        peer: peer.clone(),
+        client_cfg: client_cfg.clone(),
+        pool_cfg,
+        node_name: node_name.clone(),
+        metrics: Arc::clone(&metrics),
+        cancel: cancel.clone(),
+    });
+    tokio::join!(
+        run_peer_loop(peer, client_cfg, node_name, metrics, cancel),
+        pool
+    );
 }
 
 /// Connect to one peer and run sessions with it, reconnecting after each
@@ -225,86 +259,13 @@ async fn run_session(
 
     record_session_start(metrics, &label, start_ts);
 
-    let heartbeat_interval = Duration::from_secs(client_cfg.heartbeat_interval);
-    let echo_timeout = heartbeat_interval;
-    let mut seq: u64 = 0;
-    let mut consecutive_missed: i64 = 0;
-    let mut next_send = tokio::time::Instant::now();
-    // One reader for the whole session: the echo wait below is cut off by a
-    // deadline, and the reader keeps any partly received packet across that.
-    let mut echoes = protocol::HeartbeatReader::new();
-
-    let reason: &'static str = 'session: loop {
-        // Wait until next heartbeat time, or cancel.
-        let now = tokio::time::Instant::now();
-        if next_send > now {
-            tokio::select! {
-                () = tokio::time::sleep_until(next_send) => {},
-                () = cancel.cancelled() => break 'session "cancelled",
-            }
-        }
-        next_send += heartbeat_interval;
-
-        // Send heartbeat; record which seq we sent so we can validate the echo.
-        let sent_seq = seq;
-        let send_ts = match tokio::select! {
-            r = protocol::send_heartbeat(&mut stream, sent_seq) => r,
-            () = cancel.cancelled() => break 'session "cancelled",
-        } {
-            Ok(ts) => ts,
-            Err(e) => break 'session classify_io_error(&e),
-        };
-        metrics.client_heartbeats_sent.get_or_create(&label).inc();
-        seq += 1;
-
-        // Wait for this heartbeat's echo. An echo for an earlier heartbeat that
-        // arrived after its own timeout is queued ahead of it, so keep reading
-        // until the matching seq or this round's deadline. Stopping at the
-        // first echo would leave every later read one round behind, and RTT
-        // would never be measured again for the rest of the session.
-        let deadline = tokio::time::Instant::now() + echo_timeout;
-        let mut got_echo = false;
-        loop {
-            let echo_result = tokio::select! {
-                r = tokio::time::timeout_at(deadline, echoes.recv(&mut stream)) => r,
-                () = cancel.cancelled() => break 'session "cancelled",
-            };
-            match echo_result {
-                Err(_timeout) => break,
-                Ok(Err(e)) => break 'session classify_io_error(&e),
-                Ok(Ok(echo)) => {
-                    // Any echo, even a late one, confirms the connection is alive.
-                    got_echo = true;
-                    consecutive_missed = 0;
-                    // RTT is only meaningful for the echo matching what we sent.
-                    let matched = echo.seq == sent_seq;
-                    record_echo(metrics, &label, start_ts, matched.then_some(send_ts));
-                    if matched {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if !got_echo {
-            consecutive_missed += 1;
-            metrics.client_heartbeats_missed.get_or_create(&label).inc();
-            metrics
-                .client_consecutive_missed
-                .get_or_create(&label)
-                .set(consecutive_missed);
-            warn!(
-                "Heartbeat timeout peer={} ({}/{})",
-                peer.name, consecutive_missed, client_cfg.max_misses
-            );
-            if consecutive_missed >= i64::from(client_cfg.max_misses) {
-                break 'session "timeout";
-            }
-            // After a timeout, reset the send schedule so the next heartbeat
-            // fires after a full interval rather than immediately.
-            next_send = tokio::time::Instant::now() + heartbeat_interval;
-        }
+    let observer = PrimaryObserver {
+        metrics,
+        label: &label,
+        start_ts,
+        max_misses: client_cfg.max_misses,
     };
+    let reason = heartbeat_loop(&mut stream, client_cfg, None, cancel, &observer).await;
 
     let duration = now_f64() - start_ts;
     metrics.client_session_active.get_or_create(&label).set(0);
@@ -331,6 +292,150 @@ async fn run_session(
     reason
 }
 
+/// Records what happens in a [`heartbeat_loop`], so primary and pool
+/// sessions can share the loop but keep separate metrics.
+pub(crate) trait HeartbeatObserver: Sync {
+    /// A heartbeat was sent.
+    fn sent(&self);
+    /// An echo arrived. `rtt` is set only when it matched the heartbeat
+    /// just sent; a late echo for an earlier one has no meaningful RTT.
+    fn echo(&self, rtt: Option<f64>);
+    /// No echo arrived in time; `consecutive` counts this run of misses.
+    fn missed(&self, consecutive: i64);
+}
+
+/// Send heartbeats and wait for their echoes until the session ends.
+///
+/// Returns the disconnect reason, `"cancelled"` if `cancel` fired, or
+/// `"expired"` once `until` is reached; the session is still healthy then.
+pub(crate) async fn heartbeat_loop(
+    stream: &mut TcpStream,
+    client_cfg: &ClientConfig,
+    until: Option<Instant>,
+    cancel: &CancellationToken,
+    observer: &impl HeartbeatObserver,
+) -> &'static str {
+    let heartbeat_interval = Duration::from_secs(client_cfg.heartbeat_interval);
+    let echo_timeout = heartbeat_interval;
+    let mut seq: u64 = 0;
+    let mut consecutive_missed: i64 = 0;
+    let mut next_send = Instant::now();
+    // One reader for the whole session: the echo wait below is cut off by a
+    // deadline, and the reader keeps any partly received packet across that.
+    let mut echoes = protocol::HeartbeatReader::new();
+
+    loop {
+        // Wait until the next heartbeat time, or the end of the session's
+        // planned life if that comes first, or cancel.
+        if let Some(end) = until.filter(|end| *end <= next_send) {
+            tokio::select! {
+                () = tokio::time::sleep_until(end) => return "expired",
+                () = cancel.cancelled() => return "cancelled",
+            }
+        }
+        if next_send > Instant::now() {
+            tokio::select! {
+                () = tokio::time::sleep_until(next_send) => {},
+                () = cancel.cancelled() => return "cancelled",
+            }
+        }
+        next_send += heartbeat_interval;
+
+        // Send heartbeat; record which seq we sent so we can validate the echo.
+        let sent_seq = seq;
+        let send_ts = match tokio::select! {
+            r = protocol::send_heartbeat(stream, sent_seq) => r,
+            () = cancel.cancelled() => return "cancelled",
+        } {
+            Ok(ts) => ts,
+            Err(e) => return classify_io_error(&e),
+        };
+        observer.sent();
+        seq += 1;
+
+        // Wait for this heartbeat's echo. An echo for an earlier heartbeat that
+        // arrived after its own timeout is queued ahead of it, so keep reading
+        // until the matching seq or this round's deadline. Stopping at the
+        // first echo would leave every later read one round behind, and RTT
+        // would never be measured again for the rest of the session.
+        let deadline = Instant::now() + echo_timeout;
+        let mut got_echo = false;
+        loop {
+            let echo_result = tokio::select! {
+                r = tokio::time::timeout_at(deadline, echoes.recv(stream)) => r,
+                () = cancel.cancelled() => return "cancelled",
+            };
+            match echo_result {
+                Err(_timeout) => break,
+                Ok(Err(e)) => return classify_io_error(&e),
+                Ok(Ok(echo)) => {
+                    // Any echo, even a late one, confirms the connection is alive.
+                    got_echo = true;
+                    consecutive_missed = 0;
+                    // RTT is only meaningful for the echo matching what we sent.
+                    let matched = echo.seq == sent_seq;
+                    observer.echo(matched.then(|| now_f64() - send_ts));
+                    if matched {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !got_echo {
+            consecutive_missed += 1;
+            observer.missed(consecutive_missed);
+            if consecutive_missed >= i64::from(client_cfg.max_misses) {
+                return "timeout";
+            }
+            // After a timeout, reset the send schedule so the next heartbeat
+            // fires after a full interval rather than immediately.
+            next_send = Instant::now() + heartbeat_interval;
+        }
+    }
+}
+
+/// Records a primary session's heartbeats in the `tcp_monitor_client_*` metrics.
+#[derive(Debug)]
+struct PrimaryObserver<'a> {
+    /// Shared metrics.
+    metrics: &'a Metrics,
+    /// Labels of this session's metrics.
+    label: &'a PeerLabel,
+    /// Wall-clock start of the session.
+    start_ts: f64,
+    /// `client.max_misses`, for the log line.
+    max_misses: u32,
+}
+
+impl HeartbeatObserver for PrimaryObserver<'_> {
+    fn sent(&self) {
+        self.metrics
+            .client_heartbeats_sent
+            .get_or_create(self.label)
+            .inc();
+    }
+
+    fn echo(&self, rtt: Option<f64>) {
+        record_echo(self.metrics, self.label, self.start_ts, rtt);
+    }
+
+    fn missed(&self, consecutive: i64) {
+        self.metrics
+            .client_heartbeats_missed
+            .get_or_create(self.label)
+            .inc();
+        self.metrics
+            .client_consecutive_missed
+            .get_or_create(self.label)
+            .set(consecutive);
+        warn!(
+            "Heartbeat timeout peer={} ({}/{})",
+            self.label.peer, consecutive, self.max_misses
+        );
+    }
+}
+
 /// Record the start of a session in the client metrics.
 fn record_session_start(metrics: &Metrics, label: &PeerLabel, start_ts: f64) {
     metrics.client_session_active.get_or_create(label).set(1);
@@ -345,9 +450,9 @@ fn record_session_start(metrics: &Metrics, label: &PeerLabel, start_ts: f64) {
         .set(0);
 }
 
-/// Record a received echo. `send_ts` is the send time of the matching
-/// heartbeat, or `None` if the echo was for an earlier one (no RTT then).
-fn record_echo(metrics: &Metrics, label: &PeerLabel, start_ts: f64, send_ts: Option<f64>) {
+/// Record a received echo, with its round-trip time when it matched the
+/// heartbeat just sent (no RTT for a late echo of an earlier one).
+fn record_echo(metrics: &Metrics, label: &PeerLabel, start_ts: f64, rtt: Option<f64>) {
     let now_ts = now_f64();
     metrics.client_heartbeats_rx.get_or_create(label).inc();
     metrics
@@ -362,16 +467,13 @@ fn record_echo(metrics: &Metrics, label: &PeerLabel, start_ts: f64, send_ts: Opt
         .client_session_duration
         .get_or_create(label)
         .set(now_ts - start_ts);
-    if let Some(send_ts) = send_ts {
-        metrics
-            .client_rtt
-            .get_or_create(label)
-            .set(now_ts - send_ts);
+    if let Some(rtt) = rtt {
+        metrics.client_rtt.get_or_create(label).set(rtt);
     }
 }
 
 /// Map an I/O error to the disconnect reason reported in metrics.
-fn classify_io_error(e: &std::io::Error) -> &'static str {
+pub(crate) fn classify_io_error(e: &std::io::Error) -> &'static str {
     match e.kind() {
         std::io::ErrorKind::ConnectionReset => "connection_reset",
         std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe => "remote_close",

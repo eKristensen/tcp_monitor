@@ -10,7 +10,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tcp_monitor::config::{ClientConfig, Config, NodeConfig, PeerConfig, ServerConfig};
+use tcp_monitor::config::{ClientConfig, Config, NodeConfig, PeerConfig, PoolConfig, ServerConfig};
 use tcp_monitor::metrics::Metrics;
 use tcp_monitor::{client, protocol, server};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,6 +43,7 @@ fn node_config(name: &str, server: ServerConfig, peers: Vec<PeerConfig>) -> Conf
             heartbeat_interval: 1,
             max_misses: 3,
             reconnect_delay: 1,
+            pool: None,
         }),
         peers,
     }
@@ -101,8 +102,29 @@ struct TestClient {
 }
 
 fn start_client(name: &str, peers: Vec<PeerConfig>) -> TestClient {
+    start_client_with(node_config(name, server_config(10), peers))
+}
+
+/// A client whose peers each get a pool of `lifetime / open_interval` sessions.
+fn start_pool_client(
+    name: &str,
+    peers: Vec<PeerConfig>,
+    open_interval: u64,
+    lifetime: u64,
+) -> TestClient {
+    let mut config = node_config(name, server_config(10), peers);
+    if let Some(client) = config.client.as_mut() {
+        client.pool = Some(PoolConfig {
+            open_interval,
+            lifetime,
+        });
+    }
+    start_client_with(config)
+}
+
+fn start_client_with(config: Config) -> TestClient {
     let metrics = Metrics::new();
-    let (config_tx, config_rx) = watch::channel(node_config(name, server_config(10), peers));
+    let (config_tx, config_rx) = watch::channel(config);
     let cancel = CancellationToken::new();
     let handle = tokio::spawn(client::run_manager(
         Arc::clone(&metrics),
@@ -130,6 +152,23 @@ fn sample(text: &str, selector: &str) -> Option<f64> {
         .find(|line| line.starts_with(selector))
         .and_then(|line| line.rsplit(' ').next())
         .and_then(|value| value.parse().ok())
+}
+
+/// Sum of every sample whose line starts with `prefix` and contains `part`,
+/// e.g. all reasons of one result.
+fn sum_where(metrics: &Metrics, prefix: &str, part: &str) -> f64 {
+    metrics
+        .encode()
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with(prefix) && line.contains(part))
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum()
+}
+
+/// Predicate for [`wait_for_metric`]: the value is exactly `n` (a count).
+fn exactly(n: f64) -> impl Fn(f64) -> bool + Send + Sync {
+    move |v| (v - n).abs() < f64::EPSILON
 }
 
 /// Poll `metric` until `predicate` holds, failing the test after [`WAIT`].
@@ -165,6 +204,23 @@ async fn connect_as(server: &TestServer, name: &str) -> TcpStream {
     let mut stream = TcpStream::connect(server.heartbeat_addr).await.unwrap();
     protocol::send_handshake(&mut stream, name).await.unwrap();
     stream
+}
+
+/// Connect to the server and complete a version 2 handshake as `name`.
+async fn connect_v2(server: &TestServer, name: &str, kind: protocol::SessionKind) -> TcpStream {
+    let mut stream = TcpStream::connect(server.heartbeat_addr).await.unwrap();
+    protocol::send_handshake_v2(&mut stream, name, kind, 1)
+        .await
+        .unwrap();
+    stream
+}
+
+/// Send one heartbeat and wait for its echo.
+async fn ping(stream: &mut TcpStream) {
+    protocol::send_heartbeat(stream, 0).await.unwrap();
+    within("echo", protocol::recv_heartbeat(stream))
+        .await
+        .unwrap();
 }
 
 /// A port on 127.0.0.1 with nothing listening on it.
@@ -289,6 +345,107 @@ mod server_sessions {
             }
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn counts_concurrent_primary_sessions_from_one_peer() {
+        let server = start_server("srv", 10).await;
+        let mut first = connect_as(&server, "cli").await;
+        let mut second = connect_as(&server, "cli").await;
+        ping(&mut first).await;
+        ping(&mut second).await;
+        wait_for_metric(
+            &server.metrics,
+            r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
+            exactly(2.0),
+        )
+        .await;
+
+        // The old session ending must not hide the new one still running.
+        drop(first);
+
+        wait_for_metric(
+            &server.metrics,
+            r#"tcp_monitor_server_session_disconnects_total{node="srv",peer="cli",reason="remote_close"}"#,
+            |v| v >= 1.0,
+        )
+        .await;
+        assert_eq!(
+            metric(
+                &server.metrics,
+                r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#
+            ),
+            Some(1.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn records_a_pool_session_closed_with_goodbye_as_expired() {
+        let server = start_server("srv", 10).await;
+        let mut stream = connect_v2(&server, "cli", protocol::SessionKind::Pool).await;
+        ping(&mut stream).await;
+
+        protocol::send_goodbye(&mut stream).await.unwrap();
+        drop(stream);
+
+        wait_for_metric(
+            &server.metrics,
+            r#"tcp_monitor_server_pool_session_ends_total{node="srv",peer="cli",reason="expired"}"#,
+            |v| v >= 1.0,
+        )
+        .await;
+        assert_eq!(
+            metric(
+                &server.metrics,
+                r#"tcp_monitor_server_pool_session_ends_total{node="srv",peer="cli",reason="remote_close"}"#
+            ),
+            Some(0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn records_a_pool_session_closed_without_goodbye_as_an_early_end() {
+        let server = start_server("srv", 10).await;
+        let mut stream = connect_v2(&server, "cli", protocol::SessionKind::Pool).await;
+        ping(&mut stream).await;
+
+        drop(stream);
+
+        wait_for_metric(
+            &server.metrics,
+            r#"tcp_monitor_server_pool_session_ends_total{node="srv",peer="cli",reason="remote_close"}"#,
+            |v| v >= 1.0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn keeps_pool_sessions_out_of_the_primary_session_metrics() {
+        let server = start_server("srv", 10).await;
+        let mut stream = connect_v2(&server, "cli", protocol::SessionKind::Pool).await;
+        ping(&mut stream).await;
+
+        wait_for_metric(
+            &server.metrics,
+            r#"tcp_monitor_server_pool_sessions_active{node="srv",peer="cli"}"#,
+            exactly(1.0),
+        )
+        .await;
+        assert!(metric(&server.metrics, "tcp_monitor_server_sessions_total{").is_none());
+    }
+
+    #[tokio::test]
+    async fn echoes_check_sessions_without_counting_them() {
+        let server = start_server("srv", 10).await;
+        let mut stream = connect_v2(&server, "cli", protocol::SessionKind::Check).await;
+
+        ping(&mut stream).await;
+
+        let text = server.metrics.encode().unwrap();
+        assert!(
+            !text.contains(r#"peer="cli""#),
+            "check was counted:\n{text}"
+        );
     }
 
     #[tokio::test]
@@ -600,5 +757,210 @@ mod client_reload {
         client.cancel.cancel();
 
         within("client shutdown", client.handle).await.unwrap();
+    }
+}
+
+mod client_pool {
+    use super::*;
+
+    /// A peer that echoes heartbeats, but cuts every pool session after its
+    /// first echo, like a load balancer path dying under pinned sessions.
+    /// Primary and check sessions are echoed normally.
+    async fn start_pool_killer() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(hello) = protocol::recv_handshake(&mut stream, 5).await else {
+                        return;
+                    };
+                    while let Ok(hb) = protocol::recv_heartbeat(&mut stream).await {
+                        let echo = protocol::encode_packet(hb.seq, hb.timestamp);
+                        if stream.write_all(&echo).await.is_err()
+                            || hello.kind == protocol::SessionKind::Pool
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn fills_the_pool_at_startup() {
+        let server = start_server("srv", 10).await;
+
+        // 60 s lifetime / 20 s interval: 3 sessions, none of which expire
+        // during the test.
+        let client = start_pool_client("cli", vec![peer("srv", server.heartbeat_addr)], 20, 60);
+
+        wait_for_metric(
+            &server.metrics,
+            r#"tcp_monitor_server_pool_sessions_active{node="srv",peer="cli"}"#,
+            exactly(3.0),
+        )
+        .await;
+        wait_for_metric(
+            &client.metrics,
+            r#"tcp_monitor_client_pool_sessions_active{node="cli",peer="srv"}"#,
+            exactly(3.0),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn keeps_the_primary_session_alongside_the_pool() {
+        let server = start_server("srv", 10).await;
+
+        let _client = start_pool_client("cli", vec![peer("srv", server.heartbeat_addr)], 20, 60);
+
+        wait_for_metric(
+            &server.metrics,
+            r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
+            exactly(1.0),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn closes_sessions_at_their_planned_lifetime_as_expired_on_both_sides() {
+        let server = start_server("srv", 10).await;
+
+        // Lifetimes of 1-3 s, so sessions expire within the test.
+        let client = start_pool_client("cli", vec![peer("srv", server.heartbeat_addr)], 1, 2);
+
+        wait_for_metric(
+            &client.metrics,
+            r#"tcp_monitor_client_pool_session_ends_total{node="cli",peer="srv",reason="expired"}"#,
+            |v| v >= 2.0,
+        )
+        .await;
+        wait_for_metric(
+            &server.metrics,
+            r#"tcp_monitor_server_pool_session_ends_total{node="srv",peer="cli",reason="expired"}"#,
+            |v| v >= 2.0,
+        )
+        .await;
+        let early = sum_where(
+            &server.metrics,
+            "tcp_monitor_server_pool_session_ends_total{",
+            "",
+        ) - metric(
+            &server.metrics,
+            r#"tcp_monitor_server_pool_session_ends_total{node="srv",peer="cli",reason="expired"}"#,
+        )
+        .unwrap();
+        assert!(early == 0.0, "server saw {early} unplanned pool closes");
+    }
+
+    #[tokio::test]
+    async fn says_goodbye_to_every_session_when_stopped() {
+        let server = start_server("srv", 10).await;
+        let client = start_pool_client("cli", vec![peer("srv", server.heartbeat_addr)], 20, 60);
+        wait_for_metric(
+            &server.metrics,
+            r#"tcp_monitor_server_pool_sessions_active{node="srv",peer="cli"}"#,
+            exactly(3.0),
+        )
+        .await;
+
+        client.cancel.cancel();
+        within("client shutdown", client.handle).await.unwrap();
+
+        wait_for_metric(
+            &server.metrics,
+            r#"tcp_monitor_server_pool_session_ends_total{node="srv",peer="cli",reason="expired"}"#,
+            exactly(3.0),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn checks_a_new_session_after_an_early_end_and_finds_it_works() {
+        let addr = start_pool_killer().await;
+
+        let client = start_pool_client("cli", vec![peer("lb", addr)], 20, 60);
+
+        wait_for_metric(
+            &client.metrics,
+            r#"tcp_monitor_client_pool_session_ends_total{node="cli",peer="lb",reason="remote_close"}"#,
+            |v| v >= 1.0,
+        )
+        .await;
+        wait_for_metric(
+            &client.metrics,
+            r#"tcp_monitor_client_pool_new_session_checks_total{node="cli",peer="lb",reason="remote_close",result="ok"}"#,
+            |v| v >= 1.0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn counts_sessions_that_ended_early_as_planned_but_not_active() {
+        let addr = start_pool_killer().await;
+
+        let client = start_pool_client("cli", vec![peer("lb", addr)], 20, 60);
+
+        // All 3 sessions die after one echo; their slots stay planned until
+        // their planned end, a minute away.
+        wait_for_metric(
+            &client.metrics,
+            r#"tcp_monitor_client_pool_sessions_planned{node="cli",peer="lb"}"#,
+            exactly(3.0),
+        )
+        .await;
+        wait_for_metric(
+            &client.metrics,
+            r#"tcp_monitor_client_pool_sessions_active{node="cli",peer="lb"}"#,
+            |v| v == 0.0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn records_a_failed_check_when_the_peer_is_gone() {
+        // Echoes once on the pool session, then closes it and stops
+        // listening, so the check that follows cannot connect. The primary
+        // session, which may arrive first, is just held open.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            #[expect(
+                clippy::collection_is_never_read,
+                reason = "holds other sessions open so only the pool session ends"
+            )]
+            let mut others = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let hello = protocol::recv_handshake(&mut stream, 5).await.unwrap();
+                if hello.kind != protocol::SessionKind::Pool {
+                    others.push(stream);
+                    continue;
+                }
+                drop(listener);
+                let hb = protocol::recv_heartbeat(&mut stream).await.unwrap();
+                let echo = protocol::encode_packet(hb.seq, hb.timestamp);
+                drop(stream.write_all(&echo).await);
+                return;
+            }
+        });
+
+        let client = start_pool_client("cli", vec![peer("gone", addr)], 60, 60);
+
+        let prefix = "tcp_monitor_client_pool_new_session_checks_total{";
+        within("a failed check", async {
+            loop {
+                if sum_where(&client.metrics, prefix, r#"result="failed""#) >= 1.0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let ok = sum_where(&client.metrics, prefix, r#"result="ok""#);
+        assert!(ok < 1.0, "{ok} checks succeeded");
     }
 }
