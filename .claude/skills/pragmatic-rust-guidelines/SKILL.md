@@ -13,18 +13,21 @@ metadata:
 
 # Pragmatic Rust Guidelines (Microsoft)
 
-The full guideline text is in [references/all.txt](references/all.txt) (about 3,500 lines).
+The guideline text is in [references/excerpt.txt](references/excerpt.txt) (about 1,400 lines).
 Each guideline has an ID such as `M-PANIC-IS-STOP`. Find one with
-`grep -n "M-PANIC-IS-STOP" references/all.txt` and read that section, instead of loading the whole file.
+`grep -n "M-PANIC-IS-STOP" references/excerpt.txt` and read that section, instead of loading the
+whole file.
 
-This file is Microsoft's own agent edition, unmodified. Only this `SKILL.md` wrapper is
-local; see `../README.md` for provenance and how to update it.
+`excerpt.txt` is a verbatim excerpt of Microsoft's own agent edition: whole sections that
+apply to this crate, with lines removed but never edited. Only this `SKILL.md` wrapper is
+local. See `../README.md` for which sections were kept, provenance, and how to update.
 
 ## Guidelines that matter most for tcp-monitor
 
 tcp-monitor is a small application crate (async networking, Prometheus metrics), so the
-`Application`, `Correctness`, `Universal`, and `AI` sections apply directly. The `Library`,
-`FFI`, and `Macros` sections mostly do not.
+`Application`, `Correctness`, `Universal`, `AI`, `Documentation`, and `Project` sections
+apply, and those are the ones kept. The `Library`, `FFI`, `Macros`, and `Performance` sections
+were left out.
 
 | ID | Rule |
 |----|------|

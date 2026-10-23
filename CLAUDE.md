@@ -7,7 +7,7 @@ in `.claude/skills/`:
 
 - `rust-best-practices`: Apollo GraphQL's Rust handbook (idioms, errors, testing, linting).
 - `pragmatic-rust-guidelines`: Microsoft's Pragmatic Rust Guidelines. Look up guideline
-  IDs (e.g. `M-TAUTOLOGICAL-TESTS`) in its `references/all.txt`.
+  IDs (e.g. `M-TAUTOLOGICAL-TESTS`) in its `references/excerpt.txt`.
 
 When they conflict with this file, this file wins. Known conflicts:
 
