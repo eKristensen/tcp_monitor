@@ -16,6 +16,69 @@ pub const MAX_HANDSHAKE_NAME_LEN: usize = 256;
 /// Longest peer name kept after sanitising; longer names are truncated.
 pub const MAX_PEER_NAME_CHARS: usize = 64;
 
+/// First four bytes of a version 2 handshake ("TCM" + 0x02).
+///
+/// A version 1 handshake starts with the name length, at most 256, so a
+/// server reads this value as "version 2 follows" and an old server rejects
+/// it as an invalid length and closes the connection. Changing it breaks
+/// every deployed client that sends version 2.
+pub const HANDSHAKE_V2_MAGIC: u32 = 0x5443_4D02;
+
+/// Heartbeat sequence number a client sends to say it is closing on purpose.
+///
+/// The server records the session as `expired` instead of `remote_close`,
+/// and does not echo it. Real sequence numbers start at 0 and can never
+/// reach it.
+pub const GOODBYE_SEQ: u64 = u64::MAX;
+
+/// What an inbound session is for, sent in the version 2 handshake.
+/// The server keeps separate metrics per kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionKind {
+    /// The one long-lived session a client keeps per peer. Version 1
+    /// handshakes are always this kind.
+    Primary,
+    /// One of the many sessions in a client's pool, opened at a steady rate
+    /// and closed after a planned lifetime.
+    Pool,
+    /// A short connection that checks whether a new session works right now.
+    Check,
+}
+
+impl SessionKind {
+    /// The byte this kind is sent as. A contract with other nodes.
+    #[must_use]
+    pub const fn to_wire(self) -> u8 {
+        match self {
+            Self::Primary => 0,
+            Self::Pool => 1,
+            Self::Check => 2,
+        }
+    }
+
+    /// Inverse of [`Self::to_wire`]; `None` for an unknown byte.
+    #[must_use]
+    pub const fn from_wire(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Primary),
+            1 => Some(Self::Pool),
+            2 => Some(Self::Check),
+            _ => None,
+        }
+    }
+}
+
+/// What the server learns from a client's handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handshake {
+    /// The client's node name, sanitised for use as a label.
+    pub name: String,
+    /// What the session is for.
+    pub kind: SessionKind,
+    /// Client-chosen ID for log correlation; 0 for version 1 handshakes.
+    pub session_id: u64,
+}
+
 /// One heartbeat packet as sent by the client and echoed by the server.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Heartbeat {
@@ -41,12 +104,44 @@ pub fn encode_packet(seq: u64, timestamp: f64) -> [u8; PACKET_SIZE] {
 }
 
 /// Client calls this immediately after connect to announce its node name.
-/// Format: 4-byte BE u32 length + UTF-8 name bytes (max 256 bytes; longer
-/// names are truncated).
+/// Format (version 1): 4-byte BE u32 length + UTF-8 name bytes (max 256
+/// bytes; longer names are truncated).
+///
+/// Primary sessions keep using version 1, so they still work against servers
+/// that predate version 2.
 ///
 /// # Errors
 /// Returns any I/O error from writing to the stream.
 pub async fn send_handshake<W>(stream: &mut W, name: &str) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_name(stream, name).await
+}
+
+/// Version 2 handshake: [`HANDSHAKE_V2_MAGIC`], a kind byte, an 8-byte BE
+/// session ID, then the name exactly as in version 1. Servers older than
+/// version 2 reject it and close the connection.
+///
+/// # Errors
+/// Returns any I/O error from writing to the stream.
+pub async fn send_handshake_v2<W>(
+    stream: &mut W,
+    name: &str,
+    kind: SessionKind,
+    session_id: u64,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    stream.write_u32(HANDSHAKE_V2_MAGIC).await?;
+    stream.write_u8(kind.to_wire()).await?;
+    stream.write_u64(session_id).await?;
+    write_name(stream, name).await
+}
+
+/// Length-prefixed name, the tail of both handshake versions.
+async fn write_name<W>(stream: &mut W, name: &str) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -59,14 +154,14 @@ where
     Ok(())
 }
 
-/// Server calls this to read the client's node name from the handshake.
+/// Server calls this to read the client's handshake, either version.
 ///
 /// # Errors
 /// Returns `TimedOut` if the handshake does not arrive within `timeout_secs`,
-/// `InvalidData` if the length prefix is 0 or above 256, or any I/O error.
-/// The caller closes the connection rather than admitting it as a session
-/// with an "unknown" label.
-pub async fn recv_handshake<R>(stream: &mut R, timeout_secs: u64) -> io::Result<String>
+/// `InvalidData` if the length prefix is 0 or above 256 or the kind byte is
+/// unknown, or any I/O error. The caller closes the connection rather than
+/// admitting it as a session with an "unknown" label.
+pub async fn recv_handshake<R>(stream: &mut R, timeout_secs: u64) -> io::Result<Handshake>
 where
     R: AsyncRead + Unpin,
 {
@@ -76,12 +171,36 @@ where
 }
 
 /// The handshake read itself, without the timeout.
-async fn read_handshake<R>(stream: &mut R) -> io::Result<String>
+async fn read_handshake<R>(stream: &mut R) -> io::Result<Handshake>
 where
     R: AsyncRead + Unpin,
 {
-    let len = usize::try_from(stream.read_u32().await?)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let first = stream.read_u32().await?;
+    if first != HANDSHAKE_V2_MAGIC {
+        return Ok(Handshake {
+            name: read_name(stream, first).await?,
+            kind: SessionKind::Primary,
+            session_id: 0,
+        });
+    }
+    let kind = SessionKind::from_wire(stream.read_u8().await?).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "unknown handshake session kind")
+    })?;
+    let session_id = stream.read_u64().await?;
+    let len = stream.read_u32().await?;
+    Ok(Handshake {
+        name: read_name(stream, len).await?,
+        kind,
+        session_id,
+    })
+}
+
+/// Read a name of `len` bytes, the length prefix having been read already.
+async fn read_name<R>(stream: &mut R, len: u32) -> io::Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let len = usize::try_from(len).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if len == 0 || len > MAX_HANDSHAKE_NAME_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -123,6 +242,20 @@ where
     let ts = crate::now_f64();
     stream.write_all(&encode_packet(seq, ts)).await?;
     Ok(ts)
+}
+
+/// Tell the server this session is closing on purpose ([`GOODBYE_SEQ`]).
+/// The caller closes the stream afterwards; no echo comes back.
+///
+/// # Errors
+/// Returns any I/O error from writing to the stream.
+pub async fn send_goodbye<W>(stream: &mut W) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    stream
+        .write_all(&encode_packet(GOODBYE_SEQ, crate::now_f64()))
+        .await
 }
 
 /// Read one heartbeat packet.
@@ -257,6 +390,20 @@ mod tests {
         }
     }
 
+    mod send_goodbye {
+        use super::*;
+
+        #[tokio::test]
+        async fn sends_a_heartbeat_with_the_highest_sequence_number() {
+            let (mut tx, mut rx) = duplex(64);
+
+            send_goodbye(&mut tx).await.unwrap();
+
+            // Literal, not GOODBYE_SEQ: deployed servers look for this value.
+            assert_eq!(recv_heartbeat(&mut rx).await.unwrap().seq, u64::MAX);
+        }
+    }
+
     mod heartbeat_reader {
         use super::*;
 
@@ -314,14 +461,81 @@ mod tests {
         async fn round_trip(name: &str) -> io::Result<String> {
             let (mut tx, mut rx) = duplex(1024);
             send_handshake(&mut tx, name).await?;
-            recv_handshake(&mut rx, 1).await
+            Ok(recv_handshake(&mut rx, 1).await?.name)
         }
 
-        async fn recv_raw(bytes: &[u8]) -> io::Result<String> {
+        async fn recv_raw(bytes: &[u8]) -> io::Result<Handshake> {
             let (mut tx, mut rx) = duplex(1024);
             tx.write_all(bytes).await?;
             drop(tx);
             recv_handshake(&mut rx, 1).await
+        }
+
+        #[tokio::test]
+        async fn treats_a_version_1_handshake_as_a_primary_session() {
+            let (mut tx, mut rx) = duplex(1024);
+            send_handshake(&mut tx, "old").await.unwrap();
+
+            assert_eq!(
+                recv_handshake(&mut rx, 1).await.unwrap(),
+                Handshake {
+                    name: "old".to_owned(),
+                    kind: SessionKind::Primary,
+                    session_id: 0,
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn writes_version_2_as_magic_kind_id_then_name() {
+            let (mut tx, mut rx) = duplex(1024);
+
+            send_handshake_v2(&mut tx, "ab", SessionKind::Pool, 0x0102)
+                .await
+                .unwrap();
+            drop(tx);
+            let mut wire = Vec::new();
+            rx.read_to_end(&mut wire).await.unwrap();
+
+            // Pinned with literal bytes: deployed servers parse exactly this.
+            assert_eq!(
+                wire,
+                [
+                    0x54, 0x43, 0x4d, 0x02, // magic "TCM" 0x02
+                    1,    // kind: pool
+                    0, 0, 0, 0, 0, 0, 1, 2, // session id
+                    0, 0, 0, 2, b'a', b'b', // name
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn round_trips_a_version_2_handshake() {
+            let (mut tx, mut rx) = duplex(1024);
+            send_handshake_v2(&mut tx, "cli", SessionKind::Check, 77)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                recv_handshake(&mut rx, 1).await.unwrap(),
+                Handshake {
+                    name: "cli".to_owned(),
+                    kind: SessionKind::Check,
+                    session_id: 77,
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn recv_rejects_an_unknown_session_kind() {
+            let mut bytes = vec![0x54, 0x43, 0x4d, 0x02, 9];
+            bytes.extend_from_slice(&[0; 8]);
+            bytes.extend_from_slice(&1_u32.to_be_bytes());
+            bytes.push(b'x');
+
+            let err = recv_raw(&bytes).await.unwrap_err();
+
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
 
         #[tokio::test]
@@ -353,7 +567,7 @@ mod tests {
             let mut bytes = 2_u32.to_be_bytes().to_vec();
             bytes.extend_from_slice(&[0xff, 0xfe]);
 
-            assert_eq!(recv_raw(&bytes).await.unwrap(), "unknown");
+            assert_eq!(recv_raw(&bytes).await.unwrap().name, "unknown");
         }
 
         #[tokio::test]

@@ -2,7 +2,8 @@
 //! and serves the Blackbox Exporter probe port.
 
 use crate::config::{Config, ServerConfig};
-use crate::metrics::{DisconnectLabel, Metrics, PeerLabel};
+use crate::metrics::{disconnect_label, Metrics, PeerLabel};
+use crate::protocol::SessionKind;
 use crate::{now_f64, protocol};
 use std::io;
 use std::net::SocketAddr;
@@ -15,8 +16,14 @@ use tokio::sync::{watch, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Hard cap on concurrent inbound heartbeat sessions.
-const MAX_CONNECTIONS: usize = 128;
+/// Hard cap on concurrent inbound heartbeat sessions, of every kind.
+/// Sized for session pools: a client with the default pool keeps 96 pool
+/// sessions, one primary, and at most one short check session open to each
+/// of its peers, so a node that 10 pooling clients connect to holds about
+/// 1,000. Each session costs one socket and one small task; `LimitNOFILE` in
+/// `tcp-monitor.service` must stay above this plus the node's own outbound
+/// sessions.
+const MAX_CONNECTIONS: usize = 2048;
 
 /// Separate, smaller cap for probe connections (health-check only).
 const MAX_PROBE_CONNECTIONS: usize = 32;
@@ -229,8 +236,8 @@ async fn heartbeat_accept_loop(
     }
 }
 
-/// Run one inbound session: handshake, then echo heartbeats until it ends,
-/// recording session metrics and the disconnect reason.
+/// Run one inbound connection: read the handshake, then hand the session to
+/// the handler for its kind.
 async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -238,74 +245,159 @@ async fn handle_connection(
     node_name: String,
     metrics: Arc<Metrics>,
 ) {
-    let Ok(peer_name) = protocol::recv_handshake(&mut stream, HANDSHAKE_TIMEOUT_SECS).await else {
+    let Ok(hello) = protocol::recv_handshake(&mut stream, HANDSHAKE_TIMEOUT_SECS).await else {
         debug!("Handshake failed from {}, closing", peer_addr);
         return;
     };
 
-    if !metrics.server_peers.try_register(&peer_name) {
+    if !metrics.server_peers.try_register(&hello.name) {
         warn!(
             "Server peer limit reached ({}), rejecting peer={} addr={}",
             crate::metrics::MAX_UNIQUE_SERVER_PEERS,
-            peer_name,
+            hello.name,
             peer_addr
         );
         return;
     }
 
-    info!("Session started: peer={} addr={}", peer_name, peer_addr);
-
     let label = PeerLabel {
-        node: node_name.clone(),
-        peer: peer_name.clone(),
+        node: node_name,
+        peer: hello.name,
     };
-    metrics.init_disconnect_labels(&node_name, &peer_name);
+    match hello.kind {
+        SessionKind::Primary => {
+            run_primary(stream, peer_addr, heartbeat_recv_timeout, &label, &metrics).await;
+        }
+        SessionKind::Pool => {
+            run_pool(
+                stream,
+                heartbeat_recv_timeout,
+                &label,
+                hello.session_id,
+                &metrics,
+            )
+            .await;
+        }
+        SessionKind::Check => {
+            // A check exists to be answered, not counted: the client records
+            // the outcome, and its planned close says nothing about the path.
+            let reason = drive_session(&mut stream, heartbeat_recv_timeout, None).await;
+            debug!(
+                "Check session ended: peer={} session_id={} reason={}",
+                label.peer, hello.session_id, reason
+            );
+        }
+    }
+}
+
+/// Run a primary session: echo heartbeats until it ends, recording session
+/// metrics and the disconnect reason.
+async fn run_primary(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    heartbeat_recv_timeout: u64,
+    label: &PeerLabel,
+    metrics: &Metrics,
+) {
+    info!("Session started: peer={} addr={}", label.peer, peer_addr);
+    metrics.init_disconnect_labels(&label.node, &label.peer);
 
     let start_ts = now_f64();
-    metrics.server_session_active.get_or_create(&label).set(1);
+    // Counted up and down rather than set to 1 and 0: a reconnecting client
+    // can have a new session open before the server has timed out the old one.
+    metrics.server_session_active.get_or_create(label).inc();
     metrics
         .server_session_start
-        .get_or_create(&label)
+        .get_or_create(label)
         .set(start_ts);
-    metrics.server_sessions_total.get_or_create(&label).inc();
+    metrics.server_sessions_total.get_or_create(label).inc();
 
-    let reason = drive_session(
-        &mut stream,
-        heartbeat_recv_timeout,
-        &label,
-        &metrics,
+    let primary = Primary {
+        label,
+        metrics,
         start_ts,
-    )
-    .await;
+    };
+    let reason = drive_session(&mut stream, heartbeat_recv_timeout, Some(&primary)).await;
 
     let duration = now_f64() - start_ts;
-    metrics.server_session_active.get_or_create(&label).set(0);
+    metrics.server_session_active.get_or_create(label).dec();
     metrics
         .server_session_duration
-        .get_or_create(&label)
+        .get_or_create(label)
         .set(duration);
     metrics
         .server_disconnects
-        .get_or_create(&DisconnectLabel {
-            node: node_name,
-            peer: peer_name.clone(),
-            reason: reason.to_owned(),
-        })
+        .get_or_create(&disconnect_label(&label.node, &label.peer, reason))
         .inc();
 
     info!(
         "Session ended: peer={} duration={:.1}s reason={}",
-        peer_name, duration, reason
+        label.peer, duration, reason
     );
 }
 
+/// Run one pool session: echo heartbeats until it ends, and count how it
+/// ended. The client sends a goodbye when the session reaches its planned
+/// lifetime, so anything other than `expired` is an early end.
+async fn run_pool(
+    mut stream: TcpStream,
+    heartbeat_recv_timeout: u64,
+    label: &PeerLabel,
+    session_id: u64,
+    metrics: &Metrics,
+) {
+    metrics.init_server_pool_labels(&label.node, &label.peer);
+    metrics
+        .server_pool_sessions_active
+        .get_or_create(label)
+        .inc();
+    let started = tokio::time::Instant::now();
+
+    let reason = drive_session(&mut stream, heartbeat_recv_timeout, None).await;
+
+    metrics
+        .server_pool_sessions_active
+        .get_or_create(label)
+        .dec();
+    metrics
+        .server_pool_ends
+        .get_or_create(&disconnect_label(&label.node, &label.peer, reason))
+        .inc();
+    let age = started.elapsed().as_secs();
+    if reason == "expired" {
+        debug!(
+            "Pool session expired: peer={} session_id={} age={}s",
+            label.peer, session_id, age
+        );
+    } else {
+        info!(
+            "Pool session ended early: peer={} session_id={} age={}s reason={}",
+            label.peer, session_id, age, reason
+        );
+    }
+}
+
+/// Where [`drive_session`] records the metrics of a primary session.
+#[derive(Debug)]
+struct Primary<'a> {
+    /// Labels of this session's metrics.
+    label: &'a PeerLabel,
+    /// Shared metrics.
+    metrics: &'a Metrics,
+    /// Wall-clock start of the session.
+    start_ts: f64,
+}
+
 /// Echo heartbeats until the session ends; returns the disconnect reason.
+///
+/// `primary` is set for primary sessions, whose per-heartbeat metrics are
+/// recorded. For pool and check sessions a goodbye from the client ends the
+/// session as `expired`; primary sessions have no planned close, so there a
+/// goodbye sequence number is echoed like any other heartbeat.
 async fn drive_session(
     stream: &mut TcpStream,
     heartbeat_recv_timeout: u64,
-    label: &PeerLabel,
-    metrics: &Metrics,
-    start_ts: f64,
+    primary: Option<&Primary<'_>>,
 ) -> &'static str {
     loop {
         let result = tokio::time::timeout(
@@ -324,14 +416,20 @@ async fn drive_session(
                 return "remote_close"
             }
             Ok(Err(_)) => return "local_error",
+            Ok(Ok(hb)) if hb.seq == protocol::GOODBYE_SEQ && primary.is_none() => return "expired",
             Ok(Ok(hb)) => {
-                let now = now_f64();
-                metrics.server_heartbeats_rx.get_or_create(label).inc();
-                metrics.server_last_heartbeat.get_or_create(label).set(now);
-                metrics
-                    .server_session_duration
-                    .get_or_create(label)
-                    .set(now - start_ts);
+                if let Some(p) = primary {
+                    let now = now_f64();
+                    p.metrics.server_heartbeats_rx.get_or_create(p.label).inc();
+                    p.metrics
+                        .server_last_heartbeat
+                        .get_or_create(p.label)
+                        .set(now);
+                    p.metrics
+                        .server_session_duration
+                        .get_or_create(p.label)
+                        .set(now - p.start_ts);
+                }
 
                 let packet = protocol::encode_packet(hb.seq, hb.timestamp);
                 if let Err(e) = stream.write_all(&packet).await {

@@ -1,0 +1,84 @@
+# Example Prometheus alerting rules for session pools ([client.pool]).
+# Load with `rule_files:` in prometheus.yml and adjust thresholds and
+# severities to your environment. See "Session pools" in README.md.
+#
+# Early-end reasons: timeout (silence), connection_reset (RST), remote_close
+# (FIN), local_error (an OS error on this host). A load balancer can cut a
+# pinned session in any of the first three ways, and so does a restart of the
+# peer's tcp-monitor; the new-session check result (ok/failed) tells "pinned
+# path died" from "peer down". connect_failed means a pool session never
+# worked; it is covered by TcpMonitorPoolDepleted.
+
+groups:
+  - name: tcp_monitor_pool
+    rules:
+      # Pool sessions were cut off while new sessions to the same peer still
+      # work: the path some existing sessions are pinned to has failed (for
+      # example a load balancer backend that is down or being drained).
+      - alert: TcpMonitorPinnedSessionsDied
+        expr: |
+          sum by (node, peer) (
+            increase(tcp_monitor_client_pool_new_session_checks_total{result="ok"}[15m])
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pinned sessions {{ $labels.node }} → {{ $labels.peer }} died; new sessions work"
+          description: >-
+            Pool sessions ended early in the last 15 minutes, and a new session to
+            the same peer worked. Check tcp_monitor_client_pool_session_age_at_end_seconds
+            for when the dead sessions were opened.
+
+      # Pool sessions were cut off and new sessions fail too: the peer is
+      # unreachable, not just one pinned path.
+      - alert: TcpMonitorPeerUnreachable
+        expr: |
+          sum by (node, peer) (
+            increase(tcp_monitor_client_pool_new_session_checks_total{result="failed"}[10m])
+          ) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.node }} cannot open new sessions to {{ $labels.peer }}"
+
+      # Any unplanned end on a path, for a lower-severity notification.
+      - alert: TcpMonitorPoolSessionsEndedEarly
+        expr: |
+          sum by (node, peer, reason) (
+            increase(tcp_monitor_client_pool_session_ends_total{
+              reason!~"expired|connect_failed"}[15m])
+          ) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.node }} → {{ $labels.peer }}: pool sessions ended early ({{ $labels.reason }})"
+
+      # More than 10% of the sessions that should be alive are gone: ended
+      # early, or never opened (peer unreachable, or too old for pools). Stays
+      # active until the lost sessions' planned lifetimes have passed (up to
+      # 1.5 × lifetime), so it shows how much of the pool a failure took.
+      - alert: TcpMonitorPoolDepleted
+        expr: |
+          tcp_monitor_client_pool_sessions_active
+            < 0.9 * tcp_monitor_client_pool_sessions_planned
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.node }} → {{ $labels.peer }}: pool below 90% of planned"
+
+      # Early ends from one node to two or more of its peers at once point to
+      # something near that node (its own uplink, or a load balancer all its
+      # paths share), rather than to one destination.
+      - alert: TcpMonitorEarlyEndsToSeveralPeers
+        expr: |
+          count by (node) (
+            sum by (node, peer) (
+              increase(tcp_monitor_client_pool_session_ends_total{
+                reason!~"expired|connect_failed"}[15m])
+            ) > 0
+          ) >= 2
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.node }}: pool sessions to {{ $value }} peers ended early"

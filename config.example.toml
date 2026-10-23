@@ -2,7 +2,7 @@
 # Copy to /etc/tcp-monitor/config.toml and edit for each node.
 # Run "systemctl reload tcp-monitor" (SIGHUP) to apply peer changes live.
 # Changes to [server] bind/port/probe_port/metrics_port and [client] timing
-# require a full restart.
+# (including [client.pool]) require a full restart.
 
 [node]
 # Unique name for this node. Appears as the "node" label in all metrics,
@@ -23,6 +23,18 @@ probe_idle_timeout     = 30     # seconds before a probe connection that never c
 heartbeat_interval = 30   # seconds between outbound heartbeats
 max_misses         = 3    # consecutive missed echoes before closing the session
 reconnect_delay    = 10   # seconds to wait before reconnecting after a disconnect
+
+# Optional: a pool of staggered sessions to every peer, for paths through a
+# stateful load balancer that pins each session to the backend it picked when
+# the session opened. One long-lived session only tests one backend; the pool
+# holds sessions pinned at many different times, so it notices when the
+# sessions pinned to one backend die. See "Session pools" in the README.
+# Peers must run a version with session pool support (handshake v2).
+# Uncomment to enable; without it, each peer gets only the one primary session.
+#[client.pool]
+#open_interval = 900     # seconds between new pool sessions to each peer (±10%)
+#lifetime      = 86400   # mean planned session lifetime in seconds (each draws 50%–150%)
+#                        # pool size per peer = lifetime / open_interval = 96
 
 [[peers]]
 name = "server2"

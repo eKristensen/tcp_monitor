@@ -96,6 +96,6 @@ reduce boilerplate in common deployments; they are documented in
 | `server.heartbeat_recv_timeout` | Hot-reloads — applies to new sessions |
 | `server.probe_idle_timeout` | Hot-reloads — applies to new probe connections |
 | `server.bind`, `heartbeat_port`, `probe_port`, `metrics_port` | Requires restart — warns on reload |
-| `[client]` timing fields | Requires restart — warns on reload |
+| `[client]` timing fields, `[client.pool]` | Requires restart — warns on reload |
 | `[[peers]]` add / remove / address change | Hot-reloads — tasks started/stopped/restarted |
 | `node.name` | Partly — peer sessions started after the reload use the new name; running sessions and server labels keep the old one until restart |
