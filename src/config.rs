@@ -82,13 +82,16 @@ pub struct PoolConfig {
 impl PoolConfig {
     /// Sessions per peer once the pool has filled: `lifetime / open_interval`,
     /// rounded up. Also how many are opened at once on startup.
+    ///
+    /// An `open_interval` of 0, which validation rejects, counts as 1, so
+    /// this never divides by zero.
     #[must_use]
-    pub const fn target_size(&self) -> u64 {
-        self.lifetime.div_ceil(self.open_interval)
+    pub fn target_size(&self) -> u64 {
+        self.lifetime.div_ceil(self.open_interval.max(1))
     }
 
-    /// Rules for `[client.pool]` beyond the shared timing bounds, which
-    /// [`Config::validate`] has already checked for `open_interval`.
+    /// Rules for `[client.pool]` beyond the shared timing bounds that
+    /// [`Config::validate`] applies to `open_interval`.
     fn validate(&self) -> Result<(), String> {
         if self.lifetime < self.open_interval {
             return Err(format!(
@@ -379,6 +382,16 @@ mod tests {
                 "[client.pool]\nopen_interval = 86400\nlifetime = 604801"
             ))
             .contains("client.pool.lifetime must be at most 604800"));
+        }
+
+        #[test]
+        fn target_size_treats_a_zero_open_interval_as_one_second() {
+            let pool = PoolConfig {
+                open_interval: 0,
+                lifetime: 5,
+            };
+
+            assert_eq!(pool.target_size(), 5);
         }
 
         #[test]

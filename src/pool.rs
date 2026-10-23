@@ -12,16 +12,16 @@
 //! time it holds sessions pinned at many different moments, so it covers
 //! every path the load balancer used over the last lifetime. A session that
 //! ends before its planned lifetime was cut off; its age says when it was
-//! pinned. Each early end is followed by a check of whether a brand-new
-//! session works, which separates "old pinned sessions died" from "the peer
-//! is unreachable".
+//! pinned. An early end is followed by a check of whether a brand-new
+//! session works (at most one check at a time per peer), which separates
+//! "old pinned sessions died" from "the peer is unreachable".
 //!
 //! On startup the pool fills at once, with remaining lifetimes spread
 //! evenly, so it reaches its full size immediately instead of after one
 //! lifetime. Those first sessions all pin to wherever new sessions go at
 //! startup; the spread of pin times builds up as they are replaced.
 
-use crate::client::{classify_io_error, heartbeat_loop, HeartbeatObserver};
+use crate::client::{heartbeat_loop, HeartbeatObserver};
 use crate::config::{ClientConfig, PeerConfig, PoolConfig};
 use crate::metrics::{
     disconnect_label, pool_age_le_values, AgeLabel, CheckLabel, Metrics, PeerLabel,
@@ -37,7 +37,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -101,7 +101,7 @@ impl Ctx {
 /// What a pool session task reports back to [`run`].
 #[derive(Debug, Clone, Copy)]
 enum Event {
-    /// The session completed its handshake.
+    /// The session answered its first heartbeat, so it works.
     Established {
         /// Session ID.
         id: u64,
@@ -110,7 +110,15 @@ enum Event {
         /// When it will close itself as `expired`.
         planned_end: Instant,
     },
-    /// The session ended, or never got established (`connect_failed`).
+    /// The session never worked: no connection, or no echo of its first
+    /// heartbeat (for example an older peer that rejects handshake v2).
+    OpenFailed {
+        /// Session ID.
+        id: u64,
+        /// When it would have closed itself, had it worked.
+        planned_end: Instant,
+    },
+    /// An established session ended.
     Ended {
         /// Session ID.
         id: u64,
@@ -119,16 +127,30 @@ enum Event {
     },
 }
 
-/// One established session, alive or ended early.
+/// One session the pool planned: alive, ended early, or never opened.
 #[derive(Debug)]
 struct Slot {
-    /// When it was established.
+    /// When it was established, or when opening it failed.
     opened: Instant,
     /// When it would close itself as `expired`.
     planned_end: Instant,
-    /// False once it has ended before `planned_end`. Such a slot is kept
-    /// until `planned_end`, so `planned - active` counts the sessions lost.
+    /// False once it has ended before `planned_end`, or if it never opened.
+    /// Such a slot is kept until `planned_end`, so `planned - active`
+    /// counts the sessions lost.
     alive: bool,
+}
+
+/// The pool's bookkeeping, owned by the [`run`] loop.
+#[derive(Debug, Default)]
+struct PoolState {
+    /// Every planned session by ID.
+    slots: HashMap<u64, Slot>,
+    /// The new-session check in flight, if any. At most one runs at a time:
+    /// when a backend fails, many pinned sessions die together, and one
+    /// check answers for all of them without flooding the peer.
+    check: Option<JoinHandle<()>>,
+    /// Whether the last open failed, so a run of failures is logged once.
+    opens_failing: bool,
 }
 
 /// Run one peer's pool until `cancel` fires, then close every session.
@@ -156,9 +178,12 @@ pub async fn run(args: PoolArgs) {
 
     let mut tasks = JoinSet::new();
     let (events_tx, mut events) = mpsc::unbounded_channel();
-    let mut slots: HashMap<u64, Slot> = HashMap::new();
-    // Ranges in milliseconds: lifetimes from 50% to 150% of the configured
-    // mean, open intervals ±10%. Values are bounded by config validation.
+    let mut state = PoolState::default();
+    // Ranges in milliseconds, bounded by config validation. Steady state:
+    // lifetimes from 50% to 150% of the configured mean, open intervals ±10%.
+    // Startup fill: remaining lifetimes spread from one interval to the full
+    // lifetime, so closes, and therefore the steady-state opens that replace
+    // them, are evenly spaced, and none closes before the first new open.
     let lifetime_range = (
         pool_cfg.lifetime.saturating_mul(500),
         pool_cfg.lifetime.saturating_mul(1_500),
@@ -166,6 +191,10 @@ pub async fn run(args: PoolArgs) {
     let interval_range = (
         pool_cfg.open_interval.saturating_mul(900),
         pool_cfg.open_interval.saturating_mul(1_100),
+    );
+    let fill_range = (
+        pool_cfg.open_interval.saturating_mul(1_000),
+        pool_cfg.lifetime.saturating_mul(1_000),
     );
 
     info!(
@@ -175,22 +204,8 @@ pub async fn run(args: PoolArgs) {
         pool_cfg.open_interval
     );
 
-    // Fill: remaining lifetimes spread over (0, lifetime], so closes, and
-    // therefore the steady-state opens that replace them, are evenly spaced.
-    for _ in 0..pool_cfg.target_size() {
-        let lifetime = random_millis(1_000, pool_cfg.lifetime.saturating_mul(1_000));
-        tasks.spawn(pool_session(
-            Arc::clone(&ctx),
-            lifetime,
-            events_tx.clone(),
-            cancel.child_token(),
-        ));
-        tokio::select! {
-            () = tokio::time::sleep(FILL_SPACING) => {},
-            () = cancel.cancelled() => break,
-        }
-    }
-
+    let mut fill_left = pool_cfg.target_size();
+    let mut next_fill = Instant::now();
     let mut next_open = Instant::now() + random_millis(interval_range.0, interval_range.1);
     let mut refresh = tokio::time::interval(REFRESH_INTERVAL);
     refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -198,21 +213,30 @@ pub async fn run(args: PoolArgs) {
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
-            () = tokio::time::sleep_until(next_open) => {
-                let lifetime = random_millis(lifetime_range.0, lifetime_range.1);
+            () = tokio::time::sleep_until(next_fill), if fill_left > 0 => {
                 tasks.spawn(pool_session(
                     Arc::clone(&ctx),
-                    lifetime,
+                    random_millis(fill_range.0, fill_range.1),
+                    events_tx.clone(),
+                    cancel.child_token(),
+                ));
+                fill_left -= 1;
+                next_fill += FILL_SPACING;
+            }
+            () = tokio::time::sleep_until(next_open) => {
+                tasks.spawn(pool_session(
+                    Arc::clone(&ctx),
+                    random_millis(lifetime_range.0, lifetime_range.1),
                     events_tx.clone(),
                     cancel.child_token(),
                 ));
                 next_open += random_millis(interval_range.0, interval_range.1);
             }
             Some(event) = events.recv() => {
-                handle_event(&ctx, &mut slots, event, &mut tasks, &cancel);
-                refresh_gauges(&ctx, &mut slots);
+                state.apply(&ctx, event, &cancel);
+                state.refresh_gauges(&ctx);
             }
-            _ = refresh.tick() => refresh_gauges(&ctx, &mut slots),
+            _ = refresh.tick() => state.refresh_gauges(&ctx),
             Some(joined) = tasks.join_next() => {
                 if let Err(e) = joined {
                     error!("Pool task for {} ended abnormally: {}", ctx.peer.name, e);
@@ -221,136 +245,174 @@ pub async fn run(args: PoolArgs) {
         }
     }
 
-    // Every session holds a child token of `cancel`, so they are all
-    // stopping now; wait for their goodbyes.
+    // Every session and the check hold a child token of `cancel`, so they
+    // are all stopping now; wait for their goodbyes.
     while let Some(joined) = tasks.join_next().await {
         if let Err(e) = joined {
             error!("Pool task for {} ended abnormally: {}", ctx.peer.name, e);
         }
     }
-    slots.clear();
-    refresh_gauges(&ctx, &mut slots);
-}
-
-/// Apply one session event to `slots` and the counters, and start a
-/// new-session check after an early end.
-fn handle_event(
-    ctx: &Arc<Ctx>,
-    slots: &mut HashMap<u64, Slot>,
-    event: Event,
-    tasks: &mut JoinSet<()>,
-    cancel: &CancellationToken,
-) {
-    let metrics = &ctx.metrics;
-    let (node, peer) = (&ctx.label.node, &ctx.label.peer);
-    match event {
-        Event::Established {
-            id,
-            opened,
-            planned_end,
-        } => {
-            metrics.client_pool_opened.get_or_create(&ctx.label).inc();
-            slots.insert(
-                id,
-                Slot {
-                    opened,
-                    planned_end,
-                    alive: true,
-                },
-            );
-        }
-        Event::Ended {
-            reason: "cancelled",
-            id,
-        } => {
-            slots.remove(&id);
-        }
-        Event::Ended { id, reason } => {
-            metrics
-                .client_pool_ends
-                .get_or_create(&disconnect_label(node, peer, reason))
-                .inc();
-            let Some(slot) = slots.get_mut(&id) else {
-                // Never established: connect_failed, or the handshake failed.
-                warn!("Pool session to {} failed to open: {}", peer, reason);
-                return;
-            };
-            let age = slot.opened.elapsed();
-            metrics
-                .client_pool_age_at_end
-                .get_or_create(&disconnect_label(node, peer, reason))
-                .observe(age.as_secs_f64());
-            if reason == "expired" {
-                slots.remove(&id);
-                debug!("Pool session expired: peer={} session_id={:016x}", peer, id);
-                return;
-            }
-            slot.alive = false;
-            warn!(
-                "Pool session ended early: peer={} session_id={:016x} age={}s reason={}",
-                peer,
-                id,
-                age.as_secs(),
-                reason
-            );
-            tasks.spawn(new_session_check(
-                Arc::clone(ctx),
-                reason,
-                cancel.child_token(),
-            ));
+    if let Some(check) = state.check.take() {
+        if let Err(e) = check.await {
+            error!("Pool check for {} ended abnormally: {}", ctx.peer.name, e);
         }
     }
+    state.slots.clear();
+    state.refresh_gauges(&ctx);
 }
 
-/// Recompute the pool gauges from `slots`, first dropping ended slots whose
-/// planned end has passed.
-fn refresh_gauges(ctx: &Ctx, slots: &mut HashMap<u64, Slot>) {
-    let now = Instant::now();
-    slots.retain(|_, slot| slot.alive || slot.planned_end > now);
+impl PoolState {
+    /// Apply one session event to the slots and counters, and start a
+    /// new-session check after an early end.
+    fn apply(&mut self, ctx: &Arc<Ctx>, event: Event, cancel: &CancellationToken) {
+        let metrics = &ctx.metrics;
+        let (node, peer) = (&ctx.label.node, &ctx.label.peer);
+        match event {
+            Event::Established {
+                id,
+                opened,
+                planned_end,
+            } => {
+                metrics.client_pool_opened.get_or_create(&ctx.label).inc();
+                if self.opens_failing {
+                    info!("Pool sessions to {} open again", peer);
+                    self.opens_failing = false;
+                }
+                self.slots.insert(
+                    id,
+                    Slot {
+                        opened,
+                        planned_end,
+                        alive: true,
+                    },
+                );
+            }
+            Event::OpenFailed { id, planned_end } => {
+                metrics
+                    .client_pool_ends
+                    .get_or_create(&disconnect_label(node, peer, "connect_failed"))
+                    .inc();
+                if !self.opens_failing {
+                    warn!("Pool sessions to {} fail to open", peer);
+                    self.opens_failing = true;
+                }
+                self.slots.insert(
+                    id,
+                    Slot {
+                        opened: Instant::now(),
+                        planned_end,
+                        alive: false,
+                    },
+                );
+            }
+            Event::Ended {
+                reason: "cancelled",
+                id,
+            } => {
+                self.slots.remove(&id);
+            }
+            Event::Ended { id, reason } => {
+                metrics
+                    .client_pool_ends
+                    .get_or_create(&disconnect_label(node, peer, reason))
+                    .inc();
+                let Some(slot) = self.slots.get_mut(&id) else {
+                    // Only established sessions send `Ended`, and their slot
+                    // stays until they end; nothing is left to update.
+                    return;
+                };
+                let age = slot.opened.elapsed();
+                metrics
+                    .client_pool_age_at_end
+                    .get_or_create(&disconnect_label(node, peer, reason))
+                    .observe(age.as_secs_f64());
+                if reason == "expired" {
+                    self.slots.remove(&id);
+                    debug!("Pool session expired: peer={} session_id={:016x}", peer, id);
+                    return;
+                }
+                slot.alive = false;
+                warn!(
+                    "Pool session ended early: peer={} session_id={:016x} age={}s reason={}",
+                    peer,
+                    id,
+                    age.as_secs(),
+                    reason
+                );
+                self.start_check(ctx, reason, cancel);
+            }
+        }
+    }
 
-    let metrics = &ctx.metrics;
-    let label = &ctx.label;
-    let ages: Vec<(u64, bool)> = slots
-        .values()
-        .map(|slot| (now.duration_since(slot.opened).as_secs(), slot.alive))
-        .collect();
-    let alive = ages.iter().filter(|(_, alive)| *alive);
+    /// Start a new-session check, unless one is already running.
+    fn start_check(&mut self, ctx: &Arc<Ctx>, reason: &'static str, cancel: &CancellationToken) {
+        if self
+            .check
+            .as_ref()
+            .is_some_and(|check| !check.is_finished())
+        {
+            debug!("New-session check to {} already running", ctx.peer.name);
+            return;
+        }
+        self.check = Some(tokio::spawn(new_session_check(
+            Arc::clone(ctx),
+            reason,
+            cancel.child_token(),
+        )));
+    }
 
-    metrics
-        .client_pool_sessions_active
-        .get_or_create(label)
-        .set(count(alive.clone()));
-    metrics
-        .client_pool_sessions_planned
-        .get_or_create(label)
-        .set(count(ages.iter()));
-    metrics.client_pool_oldest_age.get_or_create(label).set(
-        alive.clone().map(|(age, _)| *age).max().map_or(0.0, |age| {
-            // Whole seconds are plenty for ages of minutes to days.
-            f64::from(u32::try_from(age).unwrap_or(u32::MAX))
-        }),
-    );
+    /// Recompute the pool gauges from the slots, first dropping ended slots
+    /// whose planned end has passed.
+    fn refresh_gauges(&mut self, ctx: &Ctx) {
+        let now = Instant::now();
+        self.slots
+            .retain(|_, slot| slot.alive || slot.planned_end > now);
 
-    let bounds = crate::metrics::POOL_AGE_BUCKETS
-        .iter()
-        .map(|b| u64::from(*b))
-        .map(Some)
-        .chain(std::iter::once(None));
-    for (bound, le) in bounds.zip(pool_age_le_values()) {
-        let within = |(age, _): &&(u64, bool)| bound.is_none_or(|b| *age <= b);
-        let age_label = AgeLabel {
-            node: label.node.clone(),
-            peer: label.peer.clone(),
-            le,
-        };
+        let metrics = &ctx.metrics;
+        let label = &ctx.label;
+        let ages: Vec<(u64, bool)> = self
+            .slots
+            .values()
+            .map(|slot| (now.duration_since(slot.opened).as_secs(), slot.alive))
+            .collect();
+        let alive = ages.iter().filter(|(_, alive)| *alive);
+
         metrics
-            .client_pool_alive_by_age
-            .get_or_create(&age_label)
-            .set(count(alive.clone().filter(within)));
+            .client_pool_sessions_active
+            .get_or_create(label)
+            .set(count(alive.clone()));
         metrics
-            .client_pool_planned_by_age
-            .get_or_create(&age_label)
-            .set(count(ages.iter().filter(within)));
+            .client_pool_sessions_planned
+            .get_or_create(label)
+            .set(count(ages.iter()));
+        metrics.client_pool_oldest_age.get_or_create(label).set(
+            alive.clone().map(|(age, _)| *age).max().map_or(0.0, |age| {
+                // Whole seconds are plenty for ages of minutes to days.
+                f64::from(u32::try_from(age).unwrap_or(u32::MAX))
+            }),
+        );
+
+        let bounds = crate::metrics::POOL_AGE_BUCKETS
+            .iter()
+            .map(|b| u64::from(*b))
+            .map(Some)
+            .chain(std::iter::once(None));
+        for (bound, le) in bounds.zip(pool_age_le_values()) {
+            let within = |(age, _): &&(u64, bool)| bound.is_none_or(|b| *age <= b);
+            let age_label = AgeLabel {
+                node: label.node.clone(),
+                peer: label.peer.clone(),
+                le,
+            };
+            metrics
+                .client_pool_alive_by_age
+                .get_or_create(&age_label)
+                .set(count(alive.clone().filter(within)));
+            metrics
+                .client_pool_planned_by_age
+                .get_or_create(&age_label)
+                .set(count(ages.iter().filter(within)));
+        }
     }
 }
 
@@ -360,6 +422,11 @@ fn count<T>(items: impl Iterator<Item = T>) -> i64 {
 }
 
 /// One pool session, from connect to close. Reports [`Event`]s to the pool.
+///
+/// The session counts as established only once its first heartbeat is
+/// echoed. A connection the peer accepts but then rejects (an older peer
+/// without handshake v2, or one at its connection limit) is therefore an
+/// `OpenFailed`, not an early end, and triggers no new-session check.
 async fn pool_session(
     ctx: Arc<Ctx>,
     lifetime: Duration,
@@ -374,39 +441,29 @@ async fn pool_session(
             debug!("Pool for {} is gone; event dropped", ctx.peer.name);
         }
     };
+    let open_failed = || Event::OpenFailed {
+        id,
+        planned_end: Instant::now() + lifetime,
+    };
 
-    let connected = tokio::select! {
-        r = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(ctx.addr())) => r,
+    let echo_timeout = Duration::from_secs(ctx.client_cfg.heartbeat_interval);
+    let open_result = tokio::select! {
+        r = tokio::time::timeout(CONNECT_TIMEOUT + echo_timeout, open_session(&ctx, id)) => r,
         () = cancel.cancelled() => return,
     };
-    let mut stream = match connected {
+    let mut stream = match open_result {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
-            debug!("Pool connect to {} failed: {}", ctx.addr(), e);
-            report(Event::Ended {
-                id,
-                reason: "connect_failed",
-            });
+            debug!("Pool session to {} failed to open: {}", ctx.addr(), e);
+            report(open_failed());
             return;
         }
         Err(_elapsed) => {
-            debug!("Pool connect to {} timed out", ctx.addr());
-            report(Event::Ended {
-                id,
-                reason: "connect_failed",
-            });
+            debug!("Pool session to {} timed out opening", ctx.addr());
+            report(open_failed());
             return;
         }
     };
-    if let Err(e) =
-        protocol::send_handshake_v2(&mut stream, &ctx.node_name, SessionKind::Pool, id).await
-    {
-        report(Event::Ended {
-            id,
-            reason: classify_io_error(&e),
-        });
-        return;
-    }
 
     let opened = Instant::now();
     let planned_end = opened + lifetime;
@@ -430,6 +487,19 @@ async fn pool_session(
     report(Event::Ended { id, reason });
 }
 
+/// Connect, send the pool handshake, and get the first heartbeat echoed.
+async fn open_session(ctx: &Ctx, id: u64) -> io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(ctx.addr()).await?;
+    protocol::send_handshake_v2(&mut stream, &ctx.node_name, SessionKind::Pool, id).await?;
+    protocol::send_heartbeat(&mut stream, 0).await?;
+    let echo = protocol::recv_heartbeat(&mut stream).await?;
+    if echo.seq == 0 {
+        Ok(stream)
+    } else {
+        Err(io::Error::new(io::ErrorKind::InvalidData, "wrong echo"))
+    }
+}
+
 /// Records pool heartbeats in the `tcp_monitor_client_pool_*` metrics.
 /// Misses are not logged per session: a pool has hundreds.
 #[derive(Debug)]
@@ -439,9 +509,20 @@ struct PoolObserver<'a> {
 }
 
 impl HeartbeatObserver for PoolObserver<'_> {
-    fn sent(&self) {}
+    fn sent(&self) {
+        self.ctx
+            .metrics
+            .client_pool_heartbeats_sent
+            .get_or_create(&self.ctx.label)
+            .inc();
+    }
 
     fn echo(&self, rtt: Option<f64>) {
+        self.ctx
+            .metrics
+            .client_pool_heartbeats_rx
+            .get_or_create(&self.ctx.label)
+            .inc();
         if let Some(rtt) = rtt {
             self.ctx
                 .metrics
@@ -547,7 +628,7 @@ fn random_u64() -> u64 {
 mod tests {
     use super::*;
 
-    mod refresh_gauges {
+    mod pool_state_refresh_gauges {
         use super::*;
 
         fn ctx() -> Ctx {
@@ -606,15 +687,18 @@ mod tests {
 
         fn refreshed() -> Ctx {
             let ctx = ctx();
-            let mut slots = HashMap::from([
-                // Alive for 4000 s.
-                (1, slot(4_000, 100, true)),
-                // Ended early 100 s in; would still be alive.
-                (2, slot(100, 100, false)),
-                // Ended early, and its planned end has passed: forgotten.
-                (3, slot(5_000, -1, false)),
-            ]);
-            refresh_gauges(&ctx, &mut slots);
+            let mut state = PoolState {
+                slots: HashMap::from([
+                    // Alive for 4000 s.
+                    (1, slot(4_000, 100, true)),
+                    // Ended early 100 s in; would still be alive.
+                    (2, slot(100, 100, false)),
+                    // Ended early, and its planned end has passed: forgotten.
+                    (3, slot(5_000, -1, false)),
+                ]),
+                ..PoolState::default()
+            };
+            state.refresh_gauges(&ctx);
             ctx
         }
 

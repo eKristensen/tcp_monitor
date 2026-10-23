@@ -66,8 +66,8 @@ All metrics carry `node` (this host's name) and `peer` labels.
 | `tcp_monitor_server_session_active` | Gauge | Primary sessions live with this peer (normally 0 or 1; briefly 2 while a reconnecting client's old session times out) |
 | `tcp_monitor_server_session_start_timestamp_seconds` | Gauge | When the current/last session started |
 | `tcp_monitor_server_session_duration_seconds` | Gauge | Duration of active or last session |
-| `tcp_monitor_server_sessions_total` | Counter | Total inbound sessions since startup |
-| `tcp_monitor_server_heartbeats_received_total` | Counter | Heartbeat packets received from peer |
+| `tcp_monitor_server_sessions_total` | Counter | Total inbound primary sessions since startup (pool sessions are counted separately) |
+| `tcp_monitor_server_heartbeats_received_total` | Counter | Heartbeat packets received on primary sessions from peer |
 | `tcp_monitor_server_last_heartbeat_timestamp_seconds` | Gauge | Time of most recent heartbeat |
 | `tcp_monitor_server_session_disconnects_total{reason}` | Counter | Disconnects by reason |
 
@@ -95,14 +95,16 @@ with a pool connects (server side).
 | Metric | Type | Description |
 |--------|------|-------------|
 | `tcp_monitor_client_pool_sessions_active` | Gauge | Pool sessions alive |
-| `tcp_monitor_client_pool_sessions_planned` | Gauge | Pool sessions that would be alive if none had ended early. `planned - active` = sessions lost |
+| `tcp_monitor_client_pool_sessions_planned` | Gauge | Pool sessions that would be alive if every one had opened and none had ended early. `planned - active` = sessions lost |
 | `tcp_monitor_client_pool_sessions_alive_by_age{le}` | Gauge | Alive sessions at most `le` seconds old (cumulative, like histogram buckets) |
 | `tcp_monitor_client_pool_sessions_planned_by_age{le}` | Gauge | The same for planned sessions; divide to get survival by age |
 | `tcp_monitor_client_pool_oldest_session_age_seconds` | Gauge | Age of the oldest live session |
-| `tcp_monitor_client_pool_sessions_opened_total` | Counter | Pool sessions established |
+| `tcp_monitor_client_pool_sessions_opened_total` | Counter | Pool sessions established (first heartbeat answered) |
 | `tcp_monitor_client_pool_session_ends_total{reason}` | Counter | Pool sessions ended, by reason; `expired` is the planned close |
 | `tcp_monitor_client_pool_session_age_at_end_seconds{reason}` | Histogram | Session age when it ended, by reason |
-| `tcp_monitor_client_pool_new_session_checks_total{reason,result}` | Counter | After each early end: did a brand-new session work (`ok`/`failed`)? |
+| `tcp_monitor_client_pool_new_session_checks_total{reason,result}` | Counter | After an early end: did a brand-new session work (`ok`/`failed`)? At most one check runs at a time per peer |
+| `tcp_monitor_client_pool_heartbeats_sent_total` | Counter | Heartbeats sent on pool sessions |
+| `tcp_monitor_client_pool_heartbeats_received_total` | Counter | Echoes received on pool sessions |
 | `tcp_monitor_client_pool_heartbeats_missed_total` | Counter | Pool heartbeat echoes not received in time |
 | `tcp_monitor_client_pool_heartbeat_rtt_seconds` | Histogram | Pool heartbeat round-trip time |
 | `tcp_monitor_server_pool_sessions_active` | Gauge | Pool sessions from this peer currently open |
@@ -116,7 +118,7 @@ with a pool connects (server side).
 | `connection_reset` | RST received — remote crash, firewall rule, or network device |
 | `timeout` | No data for N intervals, no FIN or RST — likely **silent network drop** (NAT expiry, middlebox) |
 | `local_error` | OS error on this host — interface down, routing failure |
-| `connect_failed` | Could not complete TCP handshake (client only) |
+| `connect_failed` | Could not complete TCP handshake (client only). For pool sessions: the session never worked (no connection, or its first heartbeat got no echo) |
 | `expired` | Pool sessions only: closed on purpose at the end of the planned lifetime, or because the client stopped |
 
 **Distinguishing network from host:**
@@ -156,17 +158,25 @@ session:
 - Each session draws a planned lifetime of 50%–150% of `lifetime` and closes
   itself when it gets there. It sends a goodbye first, so both ends record the
   close as `expired`.
+- A session counts as opened once its first heartbeat is echoed. A session
+  that never gets that far ends as `connect_failed`.
 - Every session heartbeats like the primary session (`[client]`
   `heartbeat_interval` and `max_misses`). A session that ends before its
-  planned lifetime **ended early**: that is the signal.
-- After each early end the client immediately opens one short check session and
-  records whether it works. `result="ok"` means *old pinned sessions died but
-  new sessions work*: a dead backend or path behind the load balancer.
-  `result="failed"` means the peer is unreachable altogether.
-- On startup the pool fills at once, with remaining lifetimes spread evenly, so
-  it is at full size immediately. Those first sessions all pin to wherever new
-  sessions go at startup; the spread of pin times builds up as they are
-  replaced over one lifetime.
+  planned lifetime **ended early**: that is the signal. A session that is
+  missing echoes when its lifetime is up is not closed as `expired`; it keeps
+  going until it recovers or times out, so a failing path is never hidden as a
+  planned close.
+- After an early end the client opens one short check session and records
+  whether it works. `result="ok"` means *old pinned sessions died but new
+  sessions work*: a dead backend or path behind the load balancer.
+  `result="failed"` means the peer is unreachable altogether. Only one check
+  runs at a time per peer, so a backend failure that kills many sessions at
+  once does not flood the peer with checks.
+- On startup the pool fills at once (one session every 100 ms), with remaining
+  lifetimes spread from one `open_interval` to one `lifetime`, so it is at full
+  size immediately. Those first sessions all pin to wherever new sessions go
+  at startup; the spread of pin times builds up as they are replaced over one
+  lifetime.
 
 ```toml
 [client.pool]
@@ -181,9 +191,9 @@ longer lifetimes keep older pinned sessions under test.
 
 **Upgrade order:** pool sessions use version 2 of the handshake. Upgrade every
 peer before enabling `[client.pool]` on any node that connects to it. Older
-servers reject the version 2 handshake, so every pool session to them would
-show as ended early. Primary sessions keep the version 1 handshake and work in
-mixed versions.
+servers reject the version 2 handshake, so every pool session to them ends as
+`connect_failed`, the pool stays empty, and `TcpMonitorPoolDepleted` fires.
+Primary sessions keep the version 1 handshake and work in mixed versions.
 
 ### Reading the data
 
@@ -234,9 +244,12 @@ on one side only.
 
 [`prometheus_alerts.example.yml`](prometheus_alerts.example.yml) has example
 rules: pinned sessions died while new ones work, peer unreachable, early ends to
-several peers from one node, and a pool depleted below 90% of planned.
-`remote_close` is left out of the path alerts, because it means the peer's
-tcp-monitor itself closed the session, for example on restart.
+several peers from one node, and a pool depleted below 90% of planned (which
+also covers a peer that pool sessions cannot open to at all). The path alerts
+include every early-end reason: a load balancer may cut a pinned session with
+a FIN (`remote_close`) as well as an RST or silence, and the new-session check
+is what separates "pinned path died" from "peer down". A restart of the peer's
+tcp-monitor also ends its pool sessions early; expect one alert per restart.
 
 ---
 

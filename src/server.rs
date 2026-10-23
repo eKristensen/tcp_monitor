@@ -17,10 +17,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Hard cap on concurrent inbound heartbeat sessions, of every kind.
-/// Sized for session pools: a client with the default pool keeps about 100
-/// sessions to each of its peers, so a node that 10 pooling clients connect
-/// to holds about 1,000. Each session costs one socket and one small task;
-/// `LimitNOFILE` in `tcp-monitor.service` must stay above this.
+/// Sized for session pools: a client with the default pool keeps 96 pool
+/// sessions, one primary, and at most one short check session open to each
+/// of its peers, so a node that 10 pooling clients connect to holds about
+/// 1,000. Each session costs one socket and one small task; `LimitNOFILE` in
+/// `tcp-monitor.service` must stay above this plus the node's own outbound
+/// sessions.
 const MAX_CONNECTIONS: usize = 2048;
 
 /// Separate, smaller cap for probe connections (health-check only).
@@ -387,8 +389,11 @@ struct Primary<'a> {
 }
 
 /// Echo heartbeats until the session ends; returns the disconnect reason.
-/// A goodbye from the client ends it as `expired`. Per-heartbeat metrics
-/// are recorded only for primary sessions.
+///
+/// `primary` is set for primary sessions, whose per-heartbeat metrics are
+/// recorded. For pool and check sessions a goodbye from the client ends the
+/// session as `expired`; primary sessions have no planned close, so there a
+/// goodbye sequence number is echoed like any other heartbeat.
 async fn drive_session(
     stream: &mut TcpStream,
     heartbeat_recv_timeout: u64,
@@ -411,7 +416,7 @@ async fn drive_session(
                 return "remote_close"
             }
             Ok(Err(_)) => return "local_error",
-            Ok(Ok(hb)) if hb.seq == protocol::GOODBYE_SEQ => return "expired",
+            Ok(Ok(hb)) if hb.seq == protocol::GOODBYE_SEQ && primary.is_none() => return "expired",
             Ok(Ok(hb)) => {
                 if let Some(p) = primary {
                     let now = now_f64();

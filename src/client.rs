@@ -10,12 +10,13 @@ use crate::{now_f64, protocol};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// A running outbound session task for one peer.
 #[derive(Debug)]
@@ -304,17 +305,32 @@ pub(crate) trait HeartbeatObserver: Sync {
     fn missed(&self, consecutive: i64);
 }
 
+/// How long a heartbeat write may still take after `cancel` fires. Finishing
+/// it keeps the stream aligned, so a goodbye sent next is read as a goodbye
+/// rather than as the tail of a half-written heartbeat. 16 bytes go out at
+/// once on any working socket; a write stuck this long means the stream is
+/// unusable anyway.
+const CANCEL_WRITE_GRACE: Duration = Duration::from_secs(1);
+
 /// Send heartbeats and wait for their echoes until the session ends.
 ///
-/// Returns the disconnect reason, `"cancelled"` if `cancel` fired, or
-/// `"expired"` once `until` is reached; the session is still healthy then.
-pub(crate) async fn heartbeat_loop(
-    stream: &mut TcpStream,
+/// Returns the disconnect reason, or `"cancelled"` if `cancel` fired, or
+/// `"expired"` at the first heartbeat time at or after `until` when the
+/// last heartbeat was answered. A session that is missing echoes at `until`
+/// keeps going until it either recovers (then `"expired"`) or reaches
+/// `max_misses` (`"timeout"`), so a failing path is never reported as a
+/// planned close. Expiry can therefore come up to one `heartbeat_interval`
+/// after `until`.
+pub(crate) async fn heartbeat_loop<S>(
+    stream: &mut S,
     client_cfg: &ClientConfig,
     until: Option<Instant>,
     cancel: &CancellationToken,
     observer: &impl HeartbeatObserver,
-) -> &'static str {
+) -> &'static str
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let heartbeat_interval = Duration::from_secs(client_cfg.heartbeat_interval);
     let echo_timeout = heartbeat_interval;
     let mut seq: u64 = 0;
@@ -326,8 +342,9 @@ pub(crate) async fn heartbeat_loop(
 
     loop {
         // Wait until the next heartbeat time, or the end of the session's
-        // planned life if that comes first, or cancel.
-        if let Some(end) = until.filter(|end| *end <= next_send) {
+        // planned life if that comes first and the session is healthy, or cancel.
+        let expires = until.filter(|end| *end <= next_send && consecutive_missed == 0);
+        if let Some(end) = expires {
             tokio::select! {
                 () = tokio::time::sleep_until(end) => return "expired",
                 () = cancel.cancelled() => return "cancelled",
@@ -343,10 +360,21 @@ pub(crate) async fn heartbeat_loop(
 
         // Send heartbeat; record which seq we sent so we can validate the echo.
         let sent_seq = seq;
-        let send_ts = match tokio::select! {
-            r = protocol::send_heartbeat(stream, sent_seq) => r,
-            () = cancel.cancelled() => return "cancelled",
-        } {
+        let sent = {
+            let send = protocol::send_heartbeat(&mut *stream, sent_seq);
+            tokio::pin!(send);
+            tokio::select! {
+                r = &mut send => r,
+                () = cancel.cancelled() => {
+                    // Finish the packet (see CANCEL_WRITE_GRACE) before giving up.
+                    if let Err(e) = tokio::time::timeout(CANCEL_WRITE_GRACE, &mut send).await {
+                        debug!("Heartbeat write still pending at cancel: {}", e);
+                    }
+                    return "cancelled";
+                }
+            }
+        };
+        let send_ts = match sent {
             Ok(ts) => ts,
             Err(e) => return classify_io_error(&e),
         };
@@ -473,7 +501,7 @@ fn record_echo(metrics: &Metrics, label: &PeerLabel, start_ts: f64, rtt: Option<
 }
 
 /// Map an I/O error to the disconnect reason reported in metrics.
-pub(crate) fn classify_io_error(e: &std::io::Error) -> &'static str {
+fn classify_io_error(e: &std::io::Error) -> &'static str {
     match e.kind() {
         std::io::ErrorKind::ConnectionReset => "connection_reset",
         std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe => "remote_close",
@@ -485,6 +513,110 @@ pub(crate) fn classify_io_error(e: &std::io::Error) -> &'static str {
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
+    use tokio::io::{duplex, AsyncWriteExt, DuplexStream};
+
+    mod heartbeat_loop {
+        use super::*;
+
+        /// Ignores everything the loop reports.
+        struct Ignore;
+
+        impl HeartbeatObserver for Ignore {
+            fn sent(&self) {}
+            fn echo(&self, _rtt: Option<f64>) {}
+            fn missed(&self, _consecutive: i64) {}
+        }
+
+        fn timing(heartbeat_interval: u64) -> ClientConfig {
+            ClientConfig {
+                heartbeat_interval,
+                max_misses: 3,
+                reconnect_delay: 1,
+                pool: None,
+            }
+        }
+
+        /// The far end of a pipe that echoes every heartbeat, like a server.
+        fn echoing_peer() -> DuplexStream {
+            let (near, mut far) = duplex(1024);
+            tokio::spawn(async move {
+                while let Ok(hb) = protocol::recv_heartbeat(&mut far).await {
+                    let echo = protocol::encode_packet(hb.seq, hb.timestamp);
+                    if far.write_all(&echo).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            near
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn expires_at_the_planned_end_while_every_heartbeat_is_answered() {
+            let mut stream = echoing_peer();
+            let until = Instant::now() + Duration::from_secs(45);
+
+            let reason = heartbeat_loop(
+                &mut stream,
+                &timing(30),
+                Some(until),
+                &CancellationToken::new(),
+                &Ignore,
+            )
+            .await;
+
+            assert_eq!(reason, "expired");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn expires_no_later_than_one_interval_after_the_planned_end() {
+            let mut stream = echoing_peer();
+            let start = Instant::now();
+
+            heartbeat_loop(
+                &mut stream,
+                &timing(30),
+                Some(start + Duration::from_secs(45)),
+                &CancellationToken::new(),
+                &Ignore,
+            )
+            .await;
+
+            assert!(
+                start.elapsed() <= Duration::from_secs(75),
+                "{:?}",
+                start.elapsed()
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn reports_timeout_not_expired_when_echoes_stop_before_the_planned_end() {
+            // Nobody answers: the far end only holds the pipe open.
+            let (mut stream, _far) = duplex(1024);
+            let until = Instant::now() + Duration::from_secs(2);
+
+            let reason = heartbeat_loop(
+                &mut stream,
+                &timing(1),
+                Some(until),
+                &CancellationToken::new(),
+                &Ignore,
+            )
+            .await;
+
+            assert_eq!(reason, "timeout");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn returns_cancelled_when_cancelled() {
+            let mut stream = echoing_peer();
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+
+            let reason = heartbeat_loop(&mut stream, &timing(30), None, &cancel, &Ignore).await;
+
+            assert_eq!(reason, "cancelled");
+        }
+    }
 
     mod classify_io_error {
         use super::*;

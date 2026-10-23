@@ -37,7 +37,8 @@ pub const SERVER_POOL_END_REASONS: [&str; 5] = [
 ];
 
 /// Reasons a client-side pool session can end with. Every reason except
-/// `expired` is an early end.
+/// `expired` is an early end; `connect_failed` means the session never
+/// worked (no connection, or no echo of its first heartbeat).
 pub const CLIENT_POOL_END_REASONS: [&str; 6] = [
     "expired",
     "remote_close",
@@ -196,6 +197,10 @@ pub struct Metrics {
     pub client_pool_age_at_end: Family<DisconnectLabel, Histogram, HistogramConstructor>,
     /// `tcp_monitor_client_pool_new_session_checks_total`
     pub client_pool_checks: Family<CheckLabel, Counter>,
+    /// `tcp_monitor_client_pool_heartbeats_sent_total`
+    pub client_pool_heartbeats_sent: Family<PeerLabel, Counter>,
+    /// `tcp_monitor_client_pool_heartbeats_received_total`
+    pub client_pool_heartbeats_rx: Family<PeerLabel, Counter>,
     /// `tcp_monitor_client_pool_heartbeats_missed_total`
     pub client_pool_heartbeats_missed: Family<PeerLabel, Counter>,
     /// `tcp_monitor_client_pool_heartbeat_rtt_seconds`
@@ -377,6 +382,14 @@ impl Metrics {
             client_pool_checks: reg!(
                 "tcp_monitor_client_pool_new_session_checks",
                 "After a pool session ends early: whether a new session to the peer works"
+            ),
+            client_pool_heartbeats_sent: reg!(
+                "tcp_monitor_client_pool_heartbeats_sent",
+                "Heartbeats sent on all pool sessions to this peer"
+            ),
+            client_pool_heartbeats_rx: reg!(
+                "tcp_monitor_client_pool_heartbeats_received",
+                "Heartbeat echoes received on all pool sessions to this peer"
             ),
             client_pool_heartbeats_missed: reg!(
                 "tcp_monitor_client_pool_heartbeats_missed",
@@ -648,6 +661,8 @@ mod tests {
             drop(metrics.client_pool_sessions_planned.get_or_create(&label));
             drop(metrics.client_pool_oldest_age.get_or_create(&label));
             drop(metrics.client_pool_opened.get_or_create(&label));
+            drop(metrics.client_pool_heartbeats_sent.get_or_create(&label));
+            drop(metrics.client_pool_heartbeats_rx.get_or_create(&label));
             drop(metrics.client_pool_heartbeats_missed.get_or_create(&label));
             metrics.client_pool_rtt.get_or_create(&label).observe(0.001);
             metrics
@@ -676,6 +691,8 @@ mod tests {
                 "tcp_monitor_client_pool_session_ends_total",
                 "tcp_monitor_client_pool_session_age_at_end_seconds_sum",
                 "tcp_monitor_client_pool_new_session_checks_total",
+                "tcp_monitor_client_pool_heartbeats_sent_total",
+                "tcp_monitor_client_pool_heartbeats_received_total",
                 "tcp_monitor_client_pool_heartbeats_missed_total",
                 "tcp_monitor_client_pool_heartbeat_rtt_seconds_sum",
                 "tcp_monitor_server_session_active",

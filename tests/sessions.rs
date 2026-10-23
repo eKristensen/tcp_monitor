@@ -921,6 +921,74 @@ mod client_pool {
     }
 
     #[tokio::test]
+    async fn counts_sessions_an_older_peer_rejects_as_failed_opens_not_early_ends() {
+        // A peer from before handshake v2 reads the magic as an invalid name
+        // length and closes the connection.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                drop(stream.read_u32().await);
+            }
+        });
+
+        let client = start_pool_client("cli", vec![peer("old", addr)], 20, 60);
+
+        wait_for_metric(
+            &client.metrics,
+            r#"tcp_monitor_client_pool_session_ends_total{node="cli",peer="old",reason="connect_failed"}"#,
+            exactly(3.0),
+        )
+        .await;
+        let checks = sum_where(
+            &client.metrics,
+            "tcp_monitor_client_pool_new_session_checks_total{",
+            "",
+        );
+        assert!(
+            checks < 1.0,
+            "{checks} checks ran for sessions that never opened"
+        );
+    }
+
+    #[tokio::test]
+    async fn counts_sessions_that_failed_to_open_as_planned_but_not_active() {
+        let addr = closed_port().await;
+
+        let client = start_pool_client("cli", vec![peer("gone", addr)], 20, 60);
+
+        wait_for_metric(
+            &client.metrics,
+            r#"tcp_monitor_client_pool_sessions_planned{node="cli",peer="gone"}"#,
+            exactly(3.0),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zeroes_the_pool_gauges_when_stopped() {
+        let server = start_server("srv", 10).await;
+        let client = start_pool_client("cli", vec![peer("srv", server.heartbeat_addr)], 20, 60);
+        wait_for_metric(
+            &client.metrics,
+            r#"tcp_monitor_client_pool_sessions_active{node="cli",peer="srv"}"#,
+            exactly(3.0),
+        )
+        .await;
+
+        client.cancel.cancel();
+        within("client shutdown", client.handle).await.unwrap();
+
+        assert_eq!(
+            metric(
+                &client.metrics,
+                r#"tcp_monitor_client_pool_sessions_planned{node="cli",peer="srv"}"#
+            ),
+            Some(0.0)
+        );
+    }
+
+    #[tokio::test]
     async fn records_a_failed_check_when_the_peer_is_gone() {
         // Echoes once on the pool session, then closes it and stops
         // listening, so the check that follows cannot connect. The primary

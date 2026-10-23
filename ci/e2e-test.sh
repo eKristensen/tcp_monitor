@@ -2,7 +2,7 @@
 # End-to-end heartbeat test.
 # Starts a server and a client; after a few 2-second heartbeats both sides
 # must show non-zero counters and a non-zero RTT in /metrics. The client also
-# runs a session pool with 1-6 s lifetimes, whose sessions must expire, and be
+# runs a session pool with 2-6 s lifetimes, whose sessions must expire, and be
 # recorded as expired on both sides, within the test.
 # Run from the repository root: ci/e2e-test.sh
 set -euo pipefail
