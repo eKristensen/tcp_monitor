@@ -181,7 +181,7 @@ mod server_sessions {
         let server = start_server("srv", 10).await;
         let mut stream = connect_as(&server, "cli").await;
 
-        let sent = protocol::encode_packet(7, 1234.5_f64);
+        let sent = protocol::encode_packet(7, 1234.5);
         stream.write_all(&sent).await.unwrap();
         let echo = within("echo", protocol::recv_heartbeat(&mut stream))
             .await
@@ -200,13 +200,13 @@ mod server_sessions {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_heartbeats_received_total{node="srv",peer="cli"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
     }
@@ -223,13 +223,13 @@ mod server_sessions {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_disconnects_total{node="srv",peer="cli",reason="remote_close"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
-            |v| v == 0.0_f64,
+            |v| v == 0.0,
         )
         .await;
     }
@@ -242,7 +242,7 @@ mod server_sessions {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_disconnects_total{node="srv",peer="cli",reason="timeout"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
     }
@@ -283,7 +283,7 @@ mod server_sessions {
                     &server.metrics,
                     r#"tcp_monitor_server_session_disconnects_total{node="srv",peer="cli",reason="timeout"}"#,
                 );
-                if timeouts.is_some_and(|v| v >= 1.0_f64) {
+                if timeouts.is_some_and(|v| v >= 1.0) {
                     return;
                 }
             }
@@ -348,19 +348,19 @@ mod client_sessions {
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_heartbeats_received_total{node="cli",peer="srv"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_heartbeat_rtt_seconds{node="cli",peer="srv"}"#,
-            |v| v > 0.0_f64,
+            |v| v > 0.0,
         )
         .await;
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_heartbeats_received_total{node="srv",peer="cli"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
     }
@@ -385,7 +385,7 @@ mod client_sessions {
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_session_disconnects_total{node="cli",peer="mute",reason="timeout"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
         assert_eq!(
@@ -393,7 +393,7 @@ mod client_sessions {
                 &client.metrics,
                 r#"tcp_monitor_client_heartbeats_missed_total{node="cli",peer="mute"}"#
             ),
-            Some(3.0_f64)
+            Some(3.0)
         );
     }
 
@@ -426,14 +426,14 @@ mod client_sessions {
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_heartbeats_missed_total{node="cli",peer="slow"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
         // ...and RTT is still measured on the prompt echoes after it.
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_heartbeat_rtt_seconds{node="cli",peer="slow"}"#,
-            |v| v > 0.0_f64,
+            |v| v > 0.0,
         )
         .await;
     }
@@ -482,7 +482,7 @@ mod client_sessions {
                     &text,
                     r#"tcp_monitor_client_heartbeat_rtt_seconds{node="cli",peer="split"}"#,
                 );
-                if rtt.is_some_and(|v| v > 0.0_f64) {
+                if rtt.is_some_and(|v| v > 0.0) {
                     return sample(
                         &text,
                         r#"tcp_monitor_client_heartbeats_sent_total{node="cli",peer="split"}"#,
@@ -493,7 +493,7 @@ mod client_sessions {
         })
         .await;
 
-        assert_eq!(sent_when_rtt_first_measured, Some(2.0_f64));
+        assert_eq!(sent_when_rtt_first_measured, Some(2.0));
     }
 
     #[tokio::test]
@@ -505,7 +505,7 @@ mod client_sessions {
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_session_disconnects_total{node="cli",peer="gone",reason="connect_failed"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
     }
@@ -526,7 +526,7 @@ mod client_reload {
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_session_active{node="cli",peer="srv"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
     }
@@ -538,7 +538,7 @@ mod client_reload {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
 
@@ -552,13 +552,13 @@ mod client_reload {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
-            |v| v == 0.0_f64,
+            |v| v == 0.0,
         )
         .await;
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_session_active{node="cli",peer="srv"}"#,
-            |v| v == 0.0_f64,
+            |v| v == 0.0,
         )
         .await;
     }
@@ -570,7 +570,7 @@ mod client_reload {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
 
@@ -581,7 +581,7 @@ mod client_reload {
         wait_for_metric(
             &server.metrics,
             r#"tcp_monitor_server_session_active{node="srv",peer="cli"}"#,
-            |v| v == 0.0_f64,
+            |v| v == 0.0,
         )
         .await;
     }
@@ -593,7 +593,7 @@ mod client_reload {
         wait_for_metric(
             &client.metrics,
             r#"tcp_monitor_client_session_active{node="cli",peer="srv"}"#,
-            |v| v >= 1.0_f64,
+            |v| v >= 1.0,
         )
         .await;
 

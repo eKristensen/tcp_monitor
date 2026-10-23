@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tcp_monitor::{client, config, metrics, server};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
+use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -27,7 +28,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Logs go to stderr: under systemd both streams reach the journal, and on a
+    // terminal argument errors land on stderr, where they belong.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("LOG_LEVEL")
                 .unwrap_or_else(|_| "info".into()),
@@ -78,44 +82,21 @@ async fn main() -> ExitCode {
     let (config_tx, config_rx) = watch::channel(initial_config.clone());
     let cancel_token = CancellationToken::new();
 
-    // SIGHUP reloads the config file and broadcasts the new version.
-    // Errors are logged; the running config is kept untouched on any failure.
-    let watcher_tx = config_tx.clone();
-    tokio::spawn(async move {
-        let mut sighup = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("SIGHUP handler init failed: {}", e);
-                return;
-            }
-        };
-        while sighup.recv().await.is_some() {
-            match config::load(&config_path) {
-                Ok(new_cfg) => {
-                    info!("Config reloaded (SIGHUP): node={}", new_cfg.node.name);
-                    if watcher_tx.send(new_cfg).is_err() {
-                        // Every receiver is gone: the process is shutting down.
-                        return;
-                    }
-                }
-                Err(e) => warn!("Config reload failed, keeping current config: {}", e),
-            }
-        }
-    });
+    tokio::spawn(watch_sighup(config_path, config_tx.clone()));
 
     // Metrics HTTP server.
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .with_state(Arc::clone(&metrics));
     info!("Metrics available at http://{}/metrics", metrics_addr);
-    tokio::spawn(async move {
+    let mut metrics_handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(metrics_listener, app).await {
             error!("Metrics server failed: {}", e);
         }
     });
 
     // TCP server (always runs; listens for inbound peer connections).
-    let server_handle = tokio::spawn(server::run(server::ServerArgs {
+    let mut server_handle = tokio::spawn(server::run(server::ServerArgs {
         listeners,
         config: initial_config.server.clone(),
         node_name: initial_config.node.name.clone(),
@@ -125,13 +106,27 @@ async fn main() -> ExitCode {
     }));
 
     // Client manager (maintains outbound peer sessions; reacts to SIGHUP reloads).
-    let client_handle = tokio::spawn(client::run_manager(
+    let mut client_handle = tokio::spawn(client::run_manager(
         Arc::clone(&metrics),
         config_rx,
         cancel_token.clone(),
     ));
 
-    cancel_token_signal().await;
+    // Every task runs until shutdown. If one stops earlier, the process can
+    // no longer produce trustworthy metrics, so exit with a failure and let
+    // systemd (Restart=always) start a complete process again.
+    let stopped_early = tokio::select! {
+        () = cancel_token_signal() => None,
+        r = &mut server_handle => Some(("server", r)),
+        r = &mut client_handle => Some(("client manager", r)),
+        r = &mut metrics_handle => Some(("metrics server", r)),
+    };
+    let mut exit = ExitCode::SUCCESS;
+    let early_task = stopped_early.as_ref().map(|(task, _)| *task);
+    if let Some((task, result)) = stopped_early {
+        report_early_stop(task, result);
+        exit = ExitCode::FAILURE;
+    }
     info!("Shutting down");
 
     // Activate the cancel token so the server accept loops stop.
@@ -140,15 +135,52 @@ async fn main() -> ExitCode {
     cancel_token.cancel();
     drop(config_tx);
 
-    let (server_result, client_result) = tokio::join!(server_handle, client_handle);
-    let mut exit = ExitCode::SUCCESS;
-    for (task, result) in [("server", server_result), ("client manager", client_result)] {
-        if let Err(e) = result {
-            error!("The {} task ended abnormally: {}", task, e);
+    // The metrics server has no shutdown signal of its own; stop it here.
+    metrics_handle.abort();
+
+    for (task, handle) in [("server", server_handle), ("client manager", client_handle)] {
+        // A handle that already completed above must not be awaited again.
+        if early_task == Some(task) {
+            continue;
+        }
+        if let Err(e) = handle.await {
+            error!("The {} task failed during shutdown: {}", task, e);
             exit = ExitCode::FAILURE;
         }
     }
     exit
+}
+
+/// On each SIGHUP, reload the config file and broadcast the new version.
+/// Errors are logged; the running config is kept untouched on any failure.
+async fn watch_sighup(config_path: PathBuf, config_tx: watch::Sender<config::Config>) {
+    let mut sighup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("SIGHUP handler init failed: {}", e);
+            return;
+        }
+    };
+    while sighup.recv().await.is_some() {
+        match config::load(&config_path) {
+            Ok(new_cfg) => {
+                info!("Config reloaded (SIGHUP): node={}", new_cfg.node.name);
+                if config_tx.send(new_cfg).is_err() {
+                    // Every receiver is gone: the process is shutting down.
+                    return;
+                }
+            }
+            Err(e) => warn!("Config reload failed, keeping current config: {}", e),
+        }
+    }
+}
+
+/// Log a task that stopped before shutdown was requested.
+fn report_early_stop(task: &str, result: Result<(), JoinError>) {
+    match result {
+        Ok(()) => error!("The {} task stopped unexpectedly; exiting", task),
+        Err(e) => error!("The {} task failed: {}; exiting", task, e),
+    }
 }
 
 /// Parse the command-line arguments (without the program name).

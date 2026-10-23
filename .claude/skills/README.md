@@ -28,6 +28,13 @@ kept line is upstream text, unchanged. Lines are only removed, never edited.
   - `SKILL.md` is a local wrapper; Microsoft publishes the guidelines as one agent-oriented
     text file, not as a skill.
 
+## Side effect: pre-approved commands
+
+Apollo's `SKILL.md` frontmatter has `allowed-tools: Bash(cargo:*) Bash(rustc:*) Bash(rustfmt:*)
+Bash(clippy:*) Read Write Edit Glob Grep`. While the skill is active, Claude Code runs those
+without asking. That is harmless for a Rust project, but it is a permission change that comes
+with the vendored text, so check that line when updating.
+
 ## Updating
 
 ```bash

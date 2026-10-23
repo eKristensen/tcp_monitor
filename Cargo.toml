@@ -73,6 +73,11 @@ variant_size_differences = "deny"
 #   each target uses a different subset of the dependencies.
 # - missing_copy_implementations: would demand `Copy` on stateful types such
 #   as HeartbeatReader, where a silent copy would duplicate buffered state.
+# Clippy restriction lints deliberately not enabled:
+# - wildcard_enum_match_arm: our only wildcards match the non-exhaustive
+#   io::ErrorKind, where `_` is required; every hit would need an #[expect].
+# - default_numeric_fallback: forces suffixes like `1.0_f64` onto literals
+#   whose type is already fixed by context; noise without safety gain.
 
 [lints.clippy]
 cargo = { level = "deny", priority = -1 }
@@ -106,7 +111,6 @@ unwrap_used = "deny"
 as_conversions = "deny"
 as_pointer_underscore = "deny"
 as_underscore = "deny"
-default_numeric_fallback = "deny"
 float_cmp_const = "deny"
 integer_division = "deny"
 lossy_float_literal = "deny"
@@ -168,7 +172,6 @@ unnecessary_self_imports = "deny"
 unneeded_field_pattern = "deny"
 unseparated_literal_suffix = "deny"
 verbose_file_reads = "deny"
-wildcard_enum_match_arm = "deny"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

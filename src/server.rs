@@ -127,11 +127,20 @@ pub async fn run(args: ServerArgs) {
         cancel.clone(),
     ));
 
-    tokio::select! {
-        _ = heartbeat_task => {},
-        _ = probe_task => {},
-        _ = config_task => {},
-        () = cancel.cancelled() => {},
+    // Each task runs until `cancel`. One that stops earlier has failed, and
+    // returning lets main notice and exit, so the service restarts complete.
+    let (task, result) = tokio::select! {
+        // On shutdown the tasks finish too; check `cancel` first so that is
+        // not mistaken for a failure.
+        biased;
+        () = cancel.cancelled() => return,
+        r = heartbeat_task => ("heartbeat accept loop", r),
+        r = probe_task => ("probe accept loop", r),
+        r = config_task => ("config watcher", r),
+    };
+    match result {
+        Ok(()) => error!("Server {} stopped unexpectedly", task),
+        Err(e) => error!("Server {} task failed: {}", task, e),
     }
 }
 
@@ -326,10 +335,6 @@ async fn drive_session(
 
                 let packet = protocol::encode_packet(hb.seq, hb.timestamp);
                 if let Err(e) = stream.write_all(&packet).await {
-                    #[expect(
-                        clippy::wildcard_enum_match_arm,
-                        reason = "io::ErrorKind is non-exhaustive with ~40 variants; every kind not listed is deliberately local_error"
-                    )]
                     match e.kind() {
                         io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset => {
                             return "connection_reset"

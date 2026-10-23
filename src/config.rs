@@ -88,6 +88,11 @@ const fn default_reconnect_delay() -> u64 {
     10
 }
 
+/// Upper bound for every timing field, in seconds (one day). Far beyond any
+/// sensible setting, and it keeps timer arithmetic (`Instant + Duration`)
+/// from overflowing, which would panic a session task.
+pub const MAX_SECONDS: u64 = 86_400;
+
 /// Combine `server.bind` and a port into a socket address.
 ///
 /// `server.bind` must be a literal IP address — IPv6 in brackets, e.g.
@@ -150,16 +155,29 @@ impl Config {
             }
         }
 
-        if self.server.heartbeat_recv_timeout == 0 {
-            return Err("server.heartbeat_recv_timeout must be at least 1".to_owned());
-        }
-
+        // (field, value, minimum). All are seconds, capped at MAX_SECONDS.
+        let mut timings = vec![
+            (
+                "server.heartbeat_recv_timeout",
+                self.server.heartbeat_recv_timeout,
+                1,
+            ),
+            (
+                "server.probe_idle_timeout",
+                self.server.probe_idle_timeout,
+                0,
+            ),
+        ];
         if let Some(ref c) = self.client {
-            if c.heartbeat_interval == 0 {
-                return Err("client.heartbeat_interval must be at least 1".to_owned());
+            timings.push(("client.heartbeat_interval", c.heartbeat_interval, 1));
+            timings.push(("client.reconnect_delay", c.reconnect_delay, 1));
+        }
+        for (field, value, min) in timings {
+            if value < min {
+                return Err(format!("{field} must be at least {min}"));
             }
-            if c.reconnect_delay == 0 {
-                return Err("client.reconnect_delay must be at least 1".to_owned());
+            if value > MAX_SECONDS {
+                return Err(format!("{field} must be at most {MAX_SECONDS} (one day)"));
             }
         }
 
@@ -269,6 +287,32 @@ mod tests {
                 SERVER_ONLY.replace("heartbeat_recv_timeout = 90", "heartbeat_recv_timeout = 0");
 
             assert!(parse_err(&text).contains("heartbeat_recv_timeout"));
+        }
+
+        #[test]
+        fn rejects_heartbeat_interval_above_one_day() {
+            assert!(parse_err(&with("[client]\nheartbeat_interval = 86401"))
+                .contains("client.heartbeat_interval must be at most 86400"));
+        }
+
+        #[test]
+        fn rejects_timeout_large_enough_to_overflow_timers() {
+            let text = SERVER_ONLY.replace(
+                "probe_idle_timeout     = 30",
+                "probe_idle_timeout     = 9223372036854775807",
+            );
+
+            assert!(parse_err(&text).contains("server.probe_idle_timeout must be at most"));
+        }
+
+        #[test]
+        fn accepts_timings_of_exactly_one_day() {
+            let cfg = parse(&with(
+                "[client]\nheartbeat_interval = 86400\nreconnect_delay = 86400",
+            ))
+            .unwrap();
+
+            assert_eq!(cfg.client.map(|c| c.heartbeat_interval), Some(86_400));
         }
 
         #[test]

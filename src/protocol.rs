@@ -180,10 +180,7 @@ impl HeartbeatReader {
         R: AsyncRead + Unpin,
     {
         while self.filled < PACKET_SIZE {
-            let unfilled = self
-                .buf
-                .get_mut(self.filled..)
-                .ok_or_else(|| io::Error::other("heartbeat buffer overrun"))?;
+            let (_, unfilled) = self.buf.split_at_mut(self.filled);
             let read = stream.read(unfilled).await?;
             if read == 0 {
                 return Err(io::Error::new(

@@ -101,3 +101,12 @@ it.
   character; the server then labels the peer `unknown`. Truncate on a character boundary.
 - **Metrics bind address**: the metrics endpoint always binds `0.0.0.0`, ignoring
   `server.bind`.
+- **Inbound slot exhaustion (security hardening).** An unauthenticated client can hold all 128
+  heartbeat slots: for 5 s each without a handshake, or for `heartbeat_recv_timeout` after
+  any handshake. Real peers are locked out meanwhile. Sending 512 distinct handshake names
+  also fills `MAX_UNIQUE_SERVER_PEERS` until restart. The caps bound memory correctly; a
+  per-source-IP limit or an `allowed_networks` allowlist would close the lockout.
+- **Peer tasks are not supervised.** A peer task ends only on cancellation; no panic path is
+  known (timing values are bounded in config validation). If one ever died anyway, the
+  client manager would not notice until the next reload. Restarting finished tasks in
+  `run_manager` would make that self-healing.

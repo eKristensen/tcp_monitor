@@ -50,9 +50,11 @@ suite on the MSRV toolchain.
 - Every item, private ones included, has a doc comment.
 - Integration test crates start with `#![cfg(test)]` so clippy applies its test
   exemptions to their helper functions too.
-- CI pins the lint toolchain (`toolchain: "1.97"` in `.github/workflows/ci.yml`), so a new
-  clippy release cannot break CI on its own. Bump it deliberately and fix new findings in the
-  same change.
+- CI pins the lint and test toolchains (`toolchain: "1.97"` in `.github/workflows/ci.yml`), so a
+  new clippy or rustc release cannot break CI on its own. Bump both together, deliberately, and
+  fix new findings in the same change.
+- The one global exception is `multiple_crate_versions = "allow"`: duplicate versions come from
+  transitive dependencies we don't control.
 - CI uses only GitHub's official `actions/*` actions plus the local
   `.github/actions/setup-rust` (rustup + `actions/cache`). Don't add third-party actions.
 
@@ -96,4 +98,4 @@ reduce boilerplate in common deployments; they are documented in
 | `server.bind`, `heartbeat_port`, `probe_port`, `metrics_port` | Requires restart — warns on reload |
 | `[client]` timing fields | Requires restart — warns on reload |
 | `[[peers]]` add / remove / address change | Hot-reloads — tasks started/stopped/restarted |
-| `node.name` | Hot-reloads — read from live config each reload cycle |
+| `node.name` | Partly — peer sessions started after the reload use the new name; running sessions and server labels keep the old one until restart |

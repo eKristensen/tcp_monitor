@@ -34,10 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Rust stable
+      # Same pin as the lint job: Cargo.toml denies whole rustc lint groups,
+      # so a newer compiler could otherwise fail the build with no code change.
+      - name: Set up Rust 1.97
         uses: ./.github/actions/setup-rust
         with:
-          toolchain: stable
+          toolchain: "1.97"
 
       - name: Unit and integration tests
         run: cargo test --locked

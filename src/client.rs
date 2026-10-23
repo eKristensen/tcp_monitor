@@ -371,10 +371,6 @@ fn record_echo(metrics: &Metrics, label: &PeerLabel, start_ts: f64, send_ts: Opt
 }
 
 /// Map an I/O error to the disconnect reason reported in metrics.
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "io::ErrorKind is non-exhaustive with ~40 variants; every kind not listed is deliberately local_error"
-)]
 fn classify_io_error(e: &std::io::Error) -> &'static str {
     match e.kind() {
         std::io::ErrorKind::ConnectionReset => "connection_reset",
