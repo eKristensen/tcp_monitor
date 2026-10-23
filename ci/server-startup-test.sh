@@ -40,4 +40,13 @@ PYEOF
 )
 
 [[ "$BANNER" == "TCP-MONITOR OK" ]] || { echo "ERROR: banner='$BANNER'"; exit 1; }
+
+# A second instance on the same ports must exit 1 promptly, not keep running
+# without its listeners. `timeout` turns a hang into exit code 124.
+set +e
+timeout 10 "$BIN" --config /tmp/server-startup.toml 2>/dev/null
+CONFLICT_EXIT=$?
+set -e
+[[ "$CONFLICT_EXIT" == 1 ]] || { echo "ERROR: port conflict exit code $CONFLICT_EXIT, want 1"; exit 1; }
+
 echo "Server startup test passed"

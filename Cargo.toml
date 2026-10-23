@@ -2,11 +2,21 @@
 name = "tcp-monitor"
 version = "0.1.0"
 edition = "2021"
-# edition 2024 requires rustc ≥ 1.85; RHEL 9's DNF rust-toolset ships ~1.75.
-# Use edition 2021 to stay compatible with official RHEL package channels.
-# Alternative: compile on a separate build machine and distribute the binary —
-# rustup-installed toolchains are not upgraded by `dnf upgrade`, so a dedicated
-# build host that tracks newer Rust is easier to maintain than per-node rustup.
+# Minimum supported Rust version. This is the real floor imposed by the locked
+# dependencies (axum 0.8 needs 1.80; hashbrown/indexmap via toml need 1.85).
+# CI builds and tests on exactly this version so the claim cannot drift.
+# Edition 2024 would also need 1.85, but stays at 2021 to keep the diff small.
+# Alternative for older RHEL toolchains: compile on a separate build machine and
+# distribute the binary — rustup-installed toolchains are not upgraded by
+# `dnf upgrade`, so a dedicated build host that tracks newer Rust is easier to
+# maintain than per-node rustup.
+rust-version = "1.85"
+description = "Monitors long-lived TCP sessions between nodes and exposes Prometheus metrics"
+license = "MIT"
+repository = "https://github.com/eKristensen/tcp_monitor"
+readme = "README.md"
+keywords = ["tcp", "monitoring", "prometheus", "network", "heartbeat"]
+categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time", "io-util"] }
@@ -17,3 +27,151 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Lint policy. Stricter than both vendored guides (.claude/skills/): Microsoft's
+# M-STATIC-VERIFICATION and Apollo use "warn" and rely on CI's `-D warnings`.
+# Here every lint is "deny", so `cargo clippy` fails locally too, and lints with
+# no legitimate exception are "forbid", which cannot be overridden at all.
+#
+# The only way past a "deny" is a local `#[expect(lint, reason = "...")]` on
+# the item that needs it. Don't weaken anything here globally.
+[lints.rust]
+unsafe_code = "forbid"
+
+future_incompatible = { level = "deny", priority = -1 }
+keyword_idents = { level = "deny", priority = -1 }
+let_underscore = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused = { level = "deny", priority = -1 }
+
+absolute_paths_not_starting_with_crate = "deny"
+ambiguous_negative_literals = "deny"
+explicit_outlives_requirements = "deny"
+macro_use_extern_crate = "deny"
+meta_variable_misuse = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
+non_ascii_idents = "deny"
+redundant_imports = "deny"
+redundant_lifetimes = "deny"
+single_use_lifetimes = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unit_bindings = "deny"
+unnameable_types = "deny"
+unreachable_pub = "deny"
+unused_import_braces = "deny"
+unused_lifetimes = "deny"
+unused_macro_rules = "deny"
+unused_qualifications = "deny"
+variant_size_differences = "deny"
+# Deliberately not enabled:
+# - unused_results: prometheus-client's Counter::inc() returns the old value,
+#   so every metric update would need `let _ =`, which hides nothing useful.
+# - unused_crate_dependencies: false positives with a lib + bin crate, where
+#   each target uses a different subset of the dependencies.
+# - missing_copy_implementations: would demand `Copy` on stateful types such
+#   as HeartbeatReader, where a silent copy would duplicate buffered state.
+# Clippy restriction lints deliberately not enabled:
+# - wildcard_enum_match_arm: our only wildcards match the non-exhaustive
+#   io::ErrorKind, where `_` is required; every hit would need an #[expect].
+# - default_numeric_fallback: forces suffixes like `1.0_f64` onto literals
+#   whose type is already fixed by context; noise without safety gain.
+
+[lints.clippy]
+cargo = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+
+# Transitive dependencies pull in duplicate crate versions we cannot control.
+multiple_crate_versions = "allow"
+
+# Restriction lints that can never be justified in this crate.
+dbg_macro = "forbid"
+todo = "forbid"
+unimplemented = "forbid"
+
+# Restriction lints: no panics, no silent truncation, no unchecked indexing
+# in production code (tests are exempted in clippy.toml).
+expect_used = "deny"
+get_unwrap = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+string_slice = "deny"
+unreachable = "deny"
+unwrap_in_result = "deny"
+unwrap_used = "deny"
+as_conversions = "deny"
+as_pointer_underscore = "deny"
+as_underscore = "deny"
+float_cmp_const = "deny"
+integer_division = "deny"
+lossy_float_literal = "deny"
+
+# Restriction lints: suppressions must be `#[expect]` with a reason.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+# Restriction lints: errors and results are never silently dropped.
+let_underscore_must_use = "deny"
+map_err_ignore = "deny"
+try_err = "deny"
+unused_result_ok = "deny"
+
+# Restriction lints: output goes through tracing, and the process exits only
+# by returning from main.
+exit = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+use_debug = "deny"
+
+# Restriction lints: clarity and consistency.
+assertions_on_result_states = "deny"
+clone_on_ref_ptr = "deny"
+deref_by_slicing = "deny"
+disallowed_script_idents = "deny"
+empty_drop = "deny"
+empty_enum_variants_with_brackets = "deny"
+empty_structs_with_brackets = "deny"
+error_impl_error = "deny"
+fn_to_numeric_cast_any = "deny"
+format_push_string = "deny"
+if_then_some_else_none = "deny"
+infinite_loop = "deny"
+mem_forget = "deny"
+missing_docs_in_private_items = "deny"
+mixed_read_write_in_expression = "deny"
+multiple_inherent_impl = "deny"
+mutex_atomic = "deny"
+mutex_integer = "deny"
+needless_raw_strings = "deny"
+partial_pub_fields = "deny"
+rc_buffer = "deny"
+rc_mutex = "deny"
+redundant_type_annotations = "deny"
+renamed_function_params = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+same_name_method = "deny"
+semicolon_outside_block = "deny"
+shadow_unrelated = "deny"
+str_to_string = "deny"
+string_add = "deny"
+string_lit_chars_any = "deny"
+tests_outside_test_module = "deny"
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
+unnecessary_self_imports = "deny"
+unneeded_field_pattern = "deny"
+unseparated_literal_suffix = "deny"
+verbose_file_reads = "deny"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

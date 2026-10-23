@@ -8,26 +8,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
-    name: Build, lint, and integration tests
+  lint:
+    name: Format and clippy
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      # Pinned so a new clippy release cannot break CI on its own. Bump
+      # deliberately and fix any new findings in the same change.
+      - name: Set up Rust 1.97
+        uses: ./.github/actions/setup-rust
         with:
-          components: clippy
+          toolchain: "1.97"
+          components: clippy,rustfmt
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build (release)
-        run: cargo build --release
+      - name: Format
+        run: cargo fmt --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: Tests and integration scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same pin as the lint job: Cargo.toml denies whole rustc lint groups,
+      # so a newer compiler could otherwise fail the build with no code change.
+      - name: Set up Rust 1.97
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain: "1.97"
+
+      - name: Unit and integration tests
+        run: cargo test --locked
+
+      - name: Build (release)
+        run: cargo build --release --locked
 
       - name: Server startup, metrics, and probe test
         run: ci/server-startup-test.sh
@@ -40,3 +58,18 @@ jobs:
 
       - name: Validate systemd unit file
         run: ci/systemd-test.sh
+
+  msrv:
+    name: Minimum supported Rust (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Must match `rust-version` in Cargo.toml.
+      - name: Set up Rust 1.85
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain: "1.85"
+
+      - name: Tests on MSRV
+        run: cargo test --locked
